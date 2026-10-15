@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Schema v17 → v18.** One forward-only migration runs automatically on first
+  load. It adds `llm_calls.turn_id` / `task_id` / `api_request_id`,
+  `tool_calls.turn_id` / `tool_call_id`, and the new `llm_call_errors` table
+  (+ index). All five columns are nullable; **rows written before the upgrade
+  keep NULL** — their turn ids were never captured, and NULL is the honest
+  value. No backfill, no data rewrite, no rollup table.
+
+### Added — Turn identity on `llm_calls` / `tool_calls` (schema v18)
+
+- `turn_id` (`{session_id}:{task_id}:{8hex}`), `task_id` and `api_request_id`
+  are now persisted on every `llm_calls` row, and `turn_id` +
+  `tool_call_id` on every `tool_calls` row — all four were already on the hook
+  payloads and were simply dropped. Per-turn cost / latency / token totals are
+  now a `GROUP BY turn_id` query instead of a timestamp heuristic, and the
+  existing `subagent_edges.parent_turn_id` joins to the parent's own calls
+  (`SELECT … FROM subagent_edges se JOIN llm_calls lc ON lc.turn_id =
+  se.parent_turn_id` — filter `se.parent_turn_id > ''`: it is populated on only
+  some edges, so an unqualified count under-reports).
+- The `subagent_stop` proxy row (`delegate_task/subagent`) carries the parent
+  turn that delegated. Its `tool_call_id` stays NULL — a delegation has no
+  model-emitted tool call id.
+
+### Added — Per-call failure ledger `llm_call_errors` (schema v18)
+
+- Failed API attempts are recorded per call, not just as the 404-class aggregate
+  in `model_unavailable_alerts`: the `api_request_error` hook now writes one
+  `llm_call_errors` row for **every** firing — any status, retryable or not —
+  before the 404-specific branch. Attempt-level by design (N attempts → N rows,
+  no dedupe), so retry storms, 429/5xx/timeout/auth failures, and "how many
+  attempts did this call take" become answerable from the DB.
+- Columns: `session_id`, `ts`, `turn_id`, `task_id`, `api_request_id`,
+  `api_call_count`, `model`, `provider`, `status_code`, `error_type`,
+  `error_message` (≤500 chars), `retry_count`, `max_retries`, `retryable`,
+  `reason`, `duration_ms` + `idx_llm_call_errors_session(session_id, ts)`.
+- Row counts are not budget inputs: nothing else reads this table, and no
+  aggregate or alert behaviour changed.
+
+### Fixed — the `api_request_error` handler read the wrong payload shape
+
+- The handler declared top-level `api_kwargs` / `error_type` / `error_message` /
+  `api_start_time`, but the emitter (`agent/api_request_hooks.py`) sends the
+  error text nested as `error={"type", "message"}`, the request as
+  `request={"method", "body"}` (model in `body["model"]`), and the duration as
+  `api_duration` in **seconds**. Under live bytes those parameters resolved to
+  `""`, so the model-unavailable alert stored an **empty**
+  `error_message` for a real 404 and looked up the wrong kwarg for the model id.
+  The handler now reads the nested shape first with the flat names kept as a
+  fallback. The 404 alert's filter, upsert, queueing and injected wording are
+  otherwise unchanged — a live-shaped 404 now stores the real message.
+
+
 ### Fixed — throttled hot-path hook error logging
 
 `pre_tool_call` / `post_tool_call` / `pre_llm_call` fire on every tool call, and
