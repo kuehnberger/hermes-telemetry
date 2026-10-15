@@ -69,6 +69,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`llm_calls(turn_id)`) and `idx_tool_turn` (`tool_calls(turn_id)`) are created
   in the same migration, and both migration tests now assert them by name **and**
   by indexed column.
+- **A non-finite `api_duration` no longer silences the failure it accompanies.**
+  `float()` / `round()` raised on `inf` / `nan` / a non-numeric string *above*
+  the ledger's own guard, so the outer handler swallowed the entire firing: no
+  ledger row and no 404 alert — the silent-failure class the ledger exists to
+  close. (`1e300` raised later, at the SQLite int64 bind inside the ledger
+  guard, losing just the row.) The conversion has its own
+  `except (TypeError, ValueError, OverflowError)` and leaves `duration_ms` NULL.
 
 ### Fixed — throttled hot-path hook error logging
 

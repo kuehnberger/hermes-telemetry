@@ -531,6 +531,14 @@ the flat names is what made the pre-v18 404 path store an empty
 is truncated to 500 chars at the write boundary (`db.record_llm_call_error`), so
 every caller inherits the bound the column advertises.
 
+Two payload-integrity rules in that handler, both easy to break:
+
+- **`api_duration` is untrusted input.** A non-finite float (`inf` / `nan`) or a
+  non-numeric string raises in `float()` / `round()`. Converted outside the
+  ledger's own `try` it killed the ledger row **and** the 404 alert — a failure
+  that leaves no trace, the class this table exists to close. The conversion has
+  its own `except (TypeError, ValueError, OverflowError)` and leaves
+  `duration_ms` NULL, which is the honest value for a duration we could not read.
 
 ### Adding a column or table — mandatory checklist
 

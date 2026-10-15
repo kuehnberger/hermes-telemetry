@@ -595,7 +595,17 @@ def register(ctx) -> None:  # noqa: ANN001
             err = error if isinstance(error, dict) else {}
             error_type = str(err.get("type") or error_type or "")
             error_message = str(err.get("message") or error_message or "")
-            duration_ms = int(round(float(api_duration or 0) * 1000))
+            # api_duration arrives from the wire, so it is not trusted: a
+            # non-finite float ("inf"/"nan") or a non-numeric string raised
+            # OverflowError/ValueError at round()/float() here — ABOVE the
+            # ledger's own try — and the outer handler swallowed it, so neither
+            # the ledger row nor the 404 alert landed: the silent-failure class
+            # this ledger exists to close. NULL is the honest value for a
+            # duration we could not read. (Found by a community reviewer.)
+            try:
+                duration_ms = int(round(float(api_duration or 0) * 1000))
+            except (TypeError, ValueError, OverflowError):
+                duration_ms = None
             req_model = _failed_request_model(request, api_kwargs, model)
 
             # Per-attempt failure ledger (v18). Deliberately BEFORE the 404

@@ -988,3 +988,46 @@ def test_v18_legacy_flat_kwargs_still_record(monkeypatch):
     assert rows[0]["status_code"] == 429
     assert rows[0]["retryable"] == 1
     assert rows[0]["reason"] == "legacy_rate_limited"
+
+
+# --- review-round hardening: unreadable duration ---------------------------
+
+
+@pytest.mark.parametrize(
+    "poison",
+    [float("inf"), float("-inf"), float("nan"), "inf", "not-a-number"],
+    ids=["inf", "-inf", "nan", "inf-str", "garbage-str"],
+)
+def test_v18_unreadable_api_duration_still_ledgers_and_still_alerts(monkeypatch, poison):
+    """A duration that cannot be read must not take the ledger and the alert down.
+
+    ``api_duration`` arrives from the wire. Its conversion sat ABOVE the
+    ledger's own try and inside only the outer handler try, so inf/nan/"inf"
+    raised at ``float()``/``round()``, the outer except logged and returned, and
+    BOTH writes were lost — the silent-failure class this ledger exists to
+    close, and a regression on the alert path (which never read api_duration
+    before v18). ``duration_ms`` is nullable and NULL is the honest value for a
+    duration that could not be read. (Found by a community reviewer.)
+    """
+    import hermes_telemetry.db as tdb
+
+    _init_mod._pending_model_unavailable_alerts.clear()
+    ctx = _register_hooks(monkeypatch)
+    _live_404(ctx, session_id="sess-poison-duration", api_duration=poison)
+
+    rows = _ledger_rows()
+    assert len(rows) == 1, "the failed attempt must still be recorded"
+    assert rows[0]["session_id"] == "sess-poison-duration"
+    assert rows[0]["status_code"] == 404
+    assert rows[0]["duration_ms"] is None
+
+    alerts = [
+        tuple(r)
+        for r in tdb._get_conn()
+        .execute("SELECT model, provider, error_code, occurrences FROM model_unavailable_alerts")
+        .fetchall()
+    ]
+    assert alerts == [("nvidia/nemotron-3-ultra:free", "nous", 404, 1)], (
+        "the 404 alert must still land"
+    )
+    assert _init_mod._pending_model_unavailable_alerts.get("sess-poison-duration") is not None
