@@ -59,6 +59,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fallback. The 404 alert's filter, upsert, queueing and injected wording are
   otherwise unchanged — a live-shaped 404 now stores the real message.
 
+### Fixed — v18 review round (turn identity + failure ledger)
+
+- **`turn_id` now has the indexes its own queries need.** v18 shipped turn
+  identity but only `idx_llm_call_errors_session`, so the per-turn rollup
+  (`GROUP BY llm_calls.turn_id`) and the delegation join
+  (`subagent_edges.parent_turn_id = llm_calls.turn_id`) fell back to scanning
+  every `llm_calls` row a long-lived DB has accumulated. `idx_llm_turn`
+  (`llm_calls(turn_id)`) and `idx_tool_turn` (`tool_calls(turn_id)`) are created
+  in the same migration, and both migration tests now assert them by name **and**
+  by indexed column.
 
 ### Fixed — throttled hot-path hook error logging
 

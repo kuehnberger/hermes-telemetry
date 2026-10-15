@@ -2148,6 +2148,14 @@ def test_schema_v18_columns():
 
     indexes = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
     assert "idx_llm_call_errors_session" in indexes
+    # Turn identity ships with the indexes its own query shapes need: the
+    # per-turn rollup (GROUP BY llm_calls.turn_id) and the delegation join
+    # (subagent_edges.parent_turn_id = llm_calls.turn_id). Asserted by name AND
+    # by indexed column — a right-named index on the wrong column answers the
+    # wrong question, and only a scan would reveal it.
+    assert {"idx_llm_turn", "idx_tool_turn"} <= indexes
+    assert [r["name"] for r in conn.execute("PRAGMA index_info(idx_llm_turn)")] == ["turn_id"]
+    assert [r["name"] for r in conn.execute("PRAGMA index_info(idx_tool_turn)")] == ["turn_id"]
 
 
 def test_schema_v18_recorded():
@@ -2186,6 +2194,8 @@ def test_migrate_v18_adds_identity_columns_from_wedged_v17():
     _rebuilt_without(conn, "llm_calls", {"turn_id", "task_id", "api_request_id"})
     _rebuilt_without(conn, "tool_calls", {"turn_id", "tool_call_id"})
     conn.execute("DROP INDEX IF EXISTS idx_llm_call_errors_session")
+    conn.execute("DROP INDEX IF EXISTS idx_llm_turn")
+    conn.execute("DROP INDEX IF EXISTS idx_tool_turn")
     conn.execute("DROP TABLE IF EXISTS llm_call_errors")
     conn.execute("DELETE FROM schema_version WHERE version >= 18")
 
@@ -2193,6 +2203,10 @@ def test_migrate_v18_adds_identity_columns_from_wedged_v17():
     tool_cols = {r[1] for r in conn.execute("PRAGMA table_info(tool_calls)")}
     assert not {"turn_id", "task_id", "api_request_id"} & llm_cols  # wedged state confirmed
     assert not {"turn_id", "tool_call_id"} & tool_cols
+    wedged_indexes = {
+        r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+    }
+    assert not {"idx_llm_turn", "idx_tool_turn"} & wedged_indexes
 
     db._ensure_schema(conn)
 
@@ -2202,6 +2216,15 @@ def test_migrate_v18_adds_identity_columns_from_wedged_v17():
     assert {"turn_id", "task_id", "api_request_id"} <= llm_cols
     assert {"turn_id", "tool_call_id"} <= tool_cols
     assert "llm_call_errors" in tables
+
+    # The upgrade path must recreate the turn indexes the migrated DB is
+    # supposed to query through, not just the columns.
+    repaired_indexes = {
+        r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+    }
+    assert {"idx_llm_turn", "idx_tool_turn"} <= repaired_indexes
+    assert [r["name"] for r in conn.execute("PRAGMA index_info(idx_llm_turn)")] == ["turn_id"]
+    assert [r["name"] for r in conn.execute("PRAGMA index_info(idx_tool_turn)")] == ["turn_id"]
 
     # And the writers must round-trip the identity columns end-to-end.
     db.start_run("v18-repair", model="m", platform="cli")

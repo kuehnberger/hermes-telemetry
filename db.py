@@ -740,6 +740,14 @@ def _migrate_v18(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_llm_call_errors_session
             ON llm_call_errors(session_id, ts);
+        -- Turn identity is only useful if the lookups it exists for are indexed:
+        -- the per-turn rollup is a GROUP BY llm_calls.turn_id, and
+        -- subagent_edges.parent_turn_id joins to llm_calls.turn_id. Without
+        -- these two the join falls back to scanning every llm_calls row a
+        -- long-lived DB has accumulated. v18 has not shipped, so they cost
+        -- nothing to add now.
+        CREATE INDEX IF NOT EXISTS idx_llm_turn ON llm_calls(turn_id);
+        CREATE INDEX IF NOT EXISTS idx_tool_turn ON tool_calls(turn_id);
     """
     )
 

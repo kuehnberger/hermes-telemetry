@@ -459,7 +459,7 @@ table before applying.
 | v15 | `pricing_snapshots.resolved_model` — Canonical model name captured when a dated id was normalized to resolve against the core `/models` catalog; NULL when the raw name resolved directly. |
 | v16 | New tables: `endpoint_payload_cache` and `model_efficiency_cache` for standalone-dashboard caches; cache writers share the plugin DB's WAL + 30s busy-timeout posture. |
 | v17 | Data-only repair (issue #89): deletes `known_free_models` rows with no evidence of being genuinely free (no wildcard `provider=''`, and no `llm_calls` row for the same model+provider with `cost_usd = 0` AND tokens > 0), plus their `free_paid_transitions` rows. No shape change. |
-| v18 | Turn identity + failure ledger. `llm_calls`: `turn_id`, `task_id`, `api_request_id`. `tool_calls`: `turn_id`, `tool_call_id`. New table `llm_call_errors` (+ `idx_llm_call_errors_session`). See `§ Turn identity and the failure ledger`. |
+| v18 | Turn identity + failure ledger. `llm_calls`: `turn_id`, `task_id`, `api_request_id`. `tool_calls`: `turn_id`, `tool_call_id`. New table `llm_call_errors` (+ `idx_llm_call_errors_session`), plus `idx_llm_turn` on `llm_calls(turn_id)` and `idx_tool_turn` on `tool_calls(turn_id)` — the two query shapes turn identity exists for. See `§ Turn identity and the failure ledger`. |
 
 `_SCHEMA_VERSION` in `db.py` is the latest applied version — keep it in lockstep
 with the highest `_migrate_vN`. `test_schema_idempotent` asserts the count of
