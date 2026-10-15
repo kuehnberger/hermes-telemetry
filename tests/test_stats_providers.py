@@ -94,12 +94,30 @@ def test_stats_by_provider_token_aggregates():
     now = db._utcnow()
     db.start_run("s1", model="m", platform="cli")
     db.record_llm_call(
-        "s1", now, "m", "openai", 100, 50, 0.001, 50,
-        cache_read_tokens=1000, cache_write_tokens=20, reasoning_tokens=10,
+        "s1",
+        now,
+        "m",
+        "openai",
+        100,
+        50,
+        0.001,
+        50,
+        cache_read_tokens=1000,
+        cache_write_tokens=20,
+        reasoning_tokens=10,
     )
     db.record_llm_call(
-        "s1", now, "m", "openai", 60, 30, 0.002, 50,
-        cache_read_tokens=500, cache_write_tokens=10, reasoning_tokens=5,
+        "s1",
+        now,
+        "m",
+        "openai",
+        60,
+        30,
+        0.002,
+        50,
+        cache_read_tokens=500,
+        cache_write_tokens=10,
+        reasoning_tokens=5,
     )
 
     rows = db.stats_by_provider(window_hours=24)
