@@ -86,6 +86,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 The `retryable` and `api_duration` gaps were both found by a community reviewer.
 
+**Known, out of scope:** `__init__.py:383` (`latency_ms = int(api_duration * 1000)`)
+carries the same unguarded-coercion shape as the failure path fixed above. It is
+pre-existing on `main`, sits in the *success* path, and a non-finite `api_duration`
+there silently loses the `llm_calls` row and its `runs` totals. Deliberately not
+changed here — this change stays limited to the four requested items.
+
 ### Fixed — throttled hot-path hook error logging
 
 `pre_tool_call` / `post_tool_call` / `pre_llm_call` fire on every tool call, and

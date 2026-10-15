@@ -514,6 +514,20 @@ The two writes for a 404 are intentional: history (`llm_call_errors`) **and** th
 alert (`model_unavailable_alerts` + the one-shot `pre_llm_call` injection). The
 alert's filter, upsert, and queueing are unchanged.
 
+**Retention: this table has no cap and no prune.** One row per failed attempt
+means a 429 retry storm, or a cron job failing auth on every run, grows
+`llm_call_errors` without bound — on a long-lived instance it accumulates rows
+faster than any other table the plugin writes. Left deliberate for now: the
+ledger exists to make failures visible, and choosing what to discard (and
+whether the answer differs for 429 vs auth vs 404, or should be a count rather
+than an age) is its own decision rather than something to guess at in the same
+change that adds the table. Tracked as a follow-up; until it lands, pruning is
+yours:
+
+```sql
+DELETE FROM llm_call_errors WHERE ts < '2026-01-01T00:00:00+00:00';
+```
+
 **Read the payload as it actually arrives.** The emitter
 (`agent/api_request_hooks.py::_invoke_api_request_error_hook`) sends:
 
