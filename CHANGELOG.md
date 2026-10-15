@@ -76,6 +76,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   close. (`1e300` raised later, at the SQLite int64 bind inside the ledger
   guard, losing just the row.) The conversion has its own
   `except (TypeError, ValueError, OverflowError)` and leaves `duration_ms` NULL.
+- **Unknown `retryable` is NULL, and the two surfaces now agree.** The handler's
+  `retryable` kwarg defaulted to `True`, so a payload that omitted the field
+  recorded `retryable = 1` — a classification it never made — while the guard
+  `if retryable:` kept a genuine non-retryable 404 out of the alert path. The
+  default is now `None` (the writer stores NULL) **and** the guard reads
+  `if retryable is not False:`; changing the default alone would make an unknown
+  falsy and fire the alert on every unclassified 404.
+
+The `retryable` and `api_duration` gaps were both found by a community reviewer.
 
 ### Fixed — throttled hot-path hook error logging
 

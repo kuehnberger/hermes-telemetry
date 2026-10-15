@@ -1031,3 +1031,50 @@ def test_v18_unreadable_api_duration_still_ledgers_and_still_alerts(monkeypatch,
         "the 404 alert must still land"
     )
     assert _init_mod._pending_model_unavailable_alerts.get("sess-poison-duration") is not None
+
+
+# --- review-round hardening: unknown retryable -----------------------------
+
+
+def test_v18_unknown_retryable_is_null_and_stays_out_of_the_alert(monkeypatch):
+    """Hook-level: a 404 payload that never states ``retryable``.
+
+    The ledger must record "the host did not say" as NULL — a 1 would assert a
+    classification the payload never made — while the 404 alert keeps the
+    behaviour it had for those payloads before the default changed (no alert).
+    The guard change is not optional: once the default is None, ``if
+    retryable:`` is falsy for None, so the alert would fire on every
+    unclassified 404 — a new regression introduced by the default flip. The
+    stated-True and stated-False payloads are asserted here too, so the fix is
+    pinned to "unchanged for what the host actually said". (Found by a
+    community reviewer.)
+    """
+    import hermes_telemetry.db as tdb
+
+    _init_mod._pending_model_unavailable_alerts.clear()
+    ctx = _register_hooks(monkeypatch)
+
+    payload = _live_404_payload("sess-unknown-retryable")
+    del payload["retryable"]  # an older host, or one that omits the field
+    assert "retryable" not in payload
+    ctx.fire("api_request_error", **payload)
+
+    conn = tdb._get_conn()
+    rows = _ledger_rows()
+    assert len(rows) == 1
+    assert rows[0]["status_code"] == 404
+    assert rows[0]["retryable"] is None, "unknown must be NULL, not 1"
+    assert conn.execute("SELECT COUNT(*) FROM model_unavailable_alerts").fetchone()[0] == 0
+    assert _init_mod._pending_model_unavailable_alerts == {}
+
+    # A stated retryable=True stays out of the alert path, exactly as before.
+    _live_404(ctx, session_id="sess-stated-retryable", retryable=True)
+    assert _ledger_rows()[1]["retryable"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM model_unavailable_alerts").fetchone()[0] == 0
+    assert "sess-stated-retryable" not in _init_mod._pending_model_unavailable_alerts
+
+    # ...while a stated retryable=False still reaches it (the class it is for).
+    _live_404(ctx, session_id="sess-stated-not-retryable", retryable=False)
+    assert _ledger_rows()[2]["retryable"] == 0
+    assert conn.execute("SELECT COUNT(*) FROM model_unavailable_alerts").fetchone()[0] == 1
+    assert _init_mod._pending_model_unavailable_alerts.get("sess-stated-not-retryable") is not None

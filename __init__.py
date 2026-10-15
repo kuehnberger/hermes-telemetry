@@ -582,7 +582,12 @@ def register(ctx) -> None:  # noqa: ANN001
         status_code: int | None = None,
         retry_count: int | None = None,
         max_retries: int | None = None,
-        retryable: bool = True,
+        # None is the default on purpose: a payload that does not state
+        # retryable has NOT said "not retryable", and the ledger records that
+        # as NULL (see record_llm_call_error). Defaulting to True wrote a
+        # classification the payload never made. (Found by a community
+        # reviewer.)
+        retryable: bool | None = None,
         reason: str = "",
         model: str = "",
         provider: str = "",
@@ -639,7 +644,13 @@ def register(ctx) -> None:  # noqa: ANN001
             # Conservative filter: 404 must be non-retryable to count as a true
             # "model gone" signal. A retryable 404 (rare, but possible from a
             # routing proxy) gets surfaced in the upstream retry loop instead.
-            if retryable:
+            # ``is not False``, not truthiness: the kwarg now defaults to None
+            # so "the host did not say" reaches the ledger as NULL, and an
+            # unknown must stay OUT of the alert path exactly as True did.
+            # Testing truthiness here would fire the alert on every
+            # unclassified 404 — a new regression introduced by the default
+            # change itself. (Found by a community reviewer.)
+            if retryable is not False:
                 return
 
             # req_model was resolved above from the request body — what the

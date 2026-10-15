@@ -539,6 +539,14 @@ Two payload-integrity rules in that handler, both easy to break:
   that leaves no trace, the class this table exists to close. The conversion has
   its own `except (TypeError, ValueError, OverflowError)` and leaves
   `duration_ms` NULL, which is the honest value for a duration we could not read.
+- **`retryable` defaults to `None`, and the 404 alert guard is
+  `if retryable is not False:`** — not truthiness. `None` means "the host did
+  not say" and is stored as NULL, not 1: a 1 asserts a classification the
+  payload never made. The guard has to be written that way: with the default
+  `None`, `if retryable:` is falsy for unknown, so the alert would fire on every
+  unclassified 404. `is not False` leaves the alert identical for every payload
+  that states the field (True → no alert, False → alert) and keeps unknown out
+  of the alert path exactly as the old `True` default did.
 
 ### Adding a column or table — mandatory checklist
 
@@ -2064,7 +2072,7 @@ the `RuntimeError` that surfaces in `cron.scheduler`. Verified kwargs
 | `api_duration`   | Seconds (multiply by 1000 for ms) — *not* `api_start_time`           |
 | `started_at`, `ended_at` | Epoch seconds                                                 |
 | `status_code`    | HTTP status (404 for model-not-found)                                |
-| `retryable`      | False for 404s                                                       |
+| `retryable`      | `False` for 404s; may be `None` when unclassified                    |
 | `reason`         | Classifier enum, e.g. `"model_not_found"`                            |
 | `retry_count`, `max_retries` | Retry context on the ledger row                           |
 | `model`, `provider` | The agent's configured model/provider                             |
