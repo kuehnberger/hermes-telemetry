@@ -16,7 +16,7 @@ A comprehensive telemetry plugin that captures real usage data, enforces budget 
 
 [![Hermes Agent](https://raw.githubusercontent.com/NousResearch/hermes-agent/HEAD/assets/banner.png)](https://raw.githubusercontent.com/NousResearch/hermes-agent/HEAD/assets/banner.png)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://camo.githubusercontent.com/08cef40a9105b6526ca22088bc514fbfdbc9aac1ddbf8d4e6c750e3a88a44dca/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f4c6963656e73652d4d49542d626c75652e737667) [![Tests: 679 passing](https://img.shields.io/badge/Tests-679%20passing-green.svg)](https://img.shields.io/badge/Tests-679%20passing-green.svg) [![Provider Support](https://img.shields.io/badge/Providers-OpenRouter-orange.svg)](https://img.shields.io/badge/Providers-OpenRouter-orange.svg) [![Challenge Entry](https://img.shields.io/badge/Hermes%20Agent-Challenge%20Entry-purple.svg)](https://camo.githubusercontent.com/d0c993fdf35127e435629279025d4b1892e351f5e04ce1547329686aa4223366/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f4865726d65732532304167656e742d4368616c6c656e6765253230456e7472792d707572706c652e737667)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://camo.githubusercontent.com/08cef40a9105b6526ca22088bc514fbfdbc9aac1ddbf8d4e6c750e3a88a44dca/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f4c6963656e73652d4d49542d626c75652e737667) [![Tests: 685 passing](https://img.shields.io/badge/Tests-685%20passing-green.svg)](https://img.shields.io/badge/Tests-685%20passing-green.svg) [![Provider Support](https://img.shields.io/badge/Providers-OpenRouter-orange.svg)](https://img.shields.io/badge/Providers-OpenRouter-orange.svg) [![Challenge Entry](https://img.shields.io/badge/Hermes%20Agent-Challenge%20Entry-purple.svg)](https://camo.githubusercontent.com/d0c993fdf35127e435629279025d4b1892e351f5e04ce1547329686aa4223366/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f4865726d65732532304167656e742d4368616c6c656e6765253230456e7472792d707572706c652e737667)
 
 -----
 
@@ -146,7 +146,7 @@ pip install pytest pyyaml
 pytest tests/ -v
 ```
 
-**Test suite (679 tests, 679 passing):**
+**Test suite (685 tests, 685 passing):**
 
 |File                             |Tests|Coverage                                                                                                                       |
 |---------------------------------|-----|-------------------------------------------------------------------------------------------------------------------------------|
@@ -164,7 +164,7 @@ pytest tests/ -v
 |`test_setup.py`                  |22   |First-time setup wizard, pricing/budget file generation, interactive + non-interactive paths                                   |
 |`test_pricing_snapshots.py`      |24   |Core-sourced pricing snapshots: append-per-change, `resolved_model` canonicalization, capture throttle, incomplete-snapshot fallback|
 |`test_observation_mode.py`       |10   |Enforce-default mode, upgrade path (no get_config still blocks), observe opt-in, watcher always on, /budget not-enforced notice, mode normalisation (case/whitespace, non-string → enforce)|
-|`test_init.py`                   |21   |Cron session ID regex, tool success/failure parsing, free→paid transition alert (detection, queueing, injection, backfill)     |
+|`test_init.py`                   |27   |Cron session ID regex, tool success/failure parsing, free→paid transition alert (detection, queueing, injection, backfill)     |
 |`test_stats_models.py`           |18   |Per-model breakdown, `/stats models` output format                                                                             |
 |`test_subagent_reconciliation.py`|15   |Parent + child hook sequence, token reconciliation, no double-counting                                                         |
 |`test_pricing_refresh.py`        |15   |Auto-refresh from OpenRouter API, change detection, manual override preservation, subscription-model metadata, `HERMES_TELEMETRY_HOME` resolution|

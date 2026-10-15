@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — throttled hot-path hook error logging
+
+`pre_tool_call` / `post_tool_call` / `pre_llm_call` fire on every tool call, and
+a failing hook used to log (and lock) once per call — under sustained pressure
+(e.g. a transient disk I/O error) the same failure amplified itself into the
+log on every call. Hook failures now emit at most once per **300s** per
+(prefix, exception class) **per plugin instance** — the throttle state is
+module-level, and Hermes keys a plugin manager (with its own imported
+submodules) per resolved Hermes home, so a process serving N profiles holds N
+copies and the real ceiling is N emits per window — with a
+suppressed-occurrence count on the next emit reporting the actual elapsed
+window. The interval deliberately differs from
+the Hermes core's 60s hook-timeout suppression window
+(`_HOOK_TIMEOUT_SUPPRESSION_SECONDS` in `hermes_cli/plugins_dispatch.py`) so
+the two never beat against each other, and the per-exception-class key means a
+*different* failure raised inside the window is surfaced immediately rather
+than swallowed by the previous one's suppression.
+
 ## [0.9.1] - 2026-10-14
 
 ### Fixed
