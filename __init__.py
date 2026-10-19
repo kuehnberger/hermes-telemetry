@@ -145,19 +145,30 @@ def _extract_cron_job_id(session_id: str, platform: str) -> str | None:
     return None
 
 
-def _is_tool_ok(result: Any) -> bool:
-    """Determine success/failure from a tool result string."""
+def _is_tool_ok(result: Any, tool_name: str = "") -> bool:
+    """Classify a tool result string; fallback for Hermes builds with no ``status``.
+
+    Approximates core's own derivation (``model_tools._tool_result_observer_fields`` /
+    ``agent.display._detect_tool_failure``): a truthy ``error`` fails, the
+    ``terminal`` tool fails on a non-zero ``exit_code`` (its result always
+    carries ``"error": null``), and ``success is False`` fails. The mere
+    presence of an ``error`` key is NOT a failure (#120).
+    """
     if not isinstance(result, str):
         return True
-    if result.startswith('{"error"'):
-        return False
     try:
         parsed = json.loads(result)
-        if isinstance(parsed, dict) and "error" in parsed:
-            return False
     except (json.JSONDecodeError, ValueError):
-        pass
-    return True
+        return True
+    if not isinstance(parsed, dict):
+        return True
+    if parsed.get("error"):
+        return False
+    if tool_name == "terminal":
+        exit_code = parsed.get("exit_code")
+        if exit_code is not None and exit_code != 0:
+            return False
+    return parsed.get("success") is not False
 
 
 # ---------------------------------------------------------------------------
@@ -711,7 +722,9 @@ def register(ctx) -> None:  # noqa: ANN001
     # post_tool_call
     # Fired after each tool execution.
     # kwargs: tool_name, result, duration_ms, session_id, task_id, args,
-    #         tool_call_id, turn_id, api_request_id
+    #         tool_call_id, turn_id, api_request_id, status (ok/error/blocked/cancelled/timeout;
+    #         absent on Hermes builds before ~2026-06-03), error_type,
+    #         error_message, middleware_trace
     # ------------------------------------------------------------------
     def post_tool_call(
         tool_name: str = "",
@@ -724,7 +737,14 @@ def register(ctx) -> None:  # noqa: ANN001
         **_kw,
     ) -> None:
         try:
-            ok = _is_tool_ok(result)
+            # Hermes core passes the authoritative outcome as ``status``
+            # ("ok" / "error" / "blocked" / "cancelled" / "timeout", see
+            # agent/tool_executor.py). Anything other than "ok" is a failed
+            # attempt (ok=0) and keeps its row.
+            # keeps its row. Builds that predate the kwarg pass nothing, so
+            # classify the result instead — never drop the row.
+            status = _kw.get("status")
+            ok = status == "ok" if status else _is_tool_ok(result, tool_name)
             db.record_tool_call(
                 session_id=session_id,
                 ts=_utcnow(),

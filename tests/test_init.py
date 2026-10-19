@@ -83,9 +83,34 @@ def test_is_tool_ok_non_json():
     assert _init_mod._is_tool_ok("some plain text") is True
 
 
-def test_is_tool_ok_nested_error():
-    """Any dict with 'error' key at top level is not ok."""
-    assert _init_mod._is_tool_ok('{"error": null, "data": 1}') is False
+def test_is_tool_ok_null_error_is_ok():
+    """`"error": null` is not a failure — only a truthy error is (#120)."""
+    assert _init_mod._is_tool_ok('{"error": null, "data": 1}') is True
+
+
+def test_is_tool_ok_truthy_error_fails():
+    assert _init_mod._is_tool_ok('{"error": "x"}') is False
+
+
+def test_is_tool_ok_terminal_exit_code():
+    """Foreground terminal always carries error=null; exit_code is the signal."""
+    ok = '{"output": "", "exit_code": 0, "error": null}'
+    bad = '{"output": "", "exit_code": 1, "error": null}'
+    assert _init_mod._is_tool_ok(ok, "terminal") is True
+    assert _init_mod._is_tool_ok(bad, "terminal") is False
+    assert _init_mod._is_tool_ok('{"exit_code": null}', "terminal") is True
+    # exit_code only means failure for the terminal tool.
+    assert _init_mod._is_tool_ok(bad, "read_file") is True
+
+
+def test_is_tool_ok_success_false():
+    assert _init_mod._is_tool_ok('{"success": false, "message": "no"}') is False
+    assert _init_mod._is_tool_ok('{"success": true}') is True
+
+
+def test_is_tool_ok_non_dict_json():
+    assert _init_mod._is_tool_ok("[1, 2]") is True
+    assert _init_mod._is_tool_ok('"error"') is True
 
 
 def test_is_tool_ok_none():
@@ -1078,3 +1103,80 @@ def test_v18_unknown_retryable_is_null_and_stays_out_of_the_alert(monkeypatch):
     assert _ledger_rows()[2]["retryable"] == 0
     assert conn.execute("SELECT COUNT(*) FROM model_unavailable_alerts").fetchone()[0] == 1
     assert _init_mod._pending_model_unavailable_alerts.get("sess-stated-not-retryable") is not None
+
+
+# ---------------------------------------------------------------------------
+# post_tool_call outcome: runtime `status` is authoritative (#120, #116)
+# ---------------------------------------------------------------------------
+
+
+def _fire_tool(ctx, *, call_id, result="{}", tool_name="terminal", **extra):
+    ctx.fire(
+        "post_tool_call",
+        session_id="sess-status",
+        task_id="t1",
+        turn_id="sess-status:t1:aaaa1111",
+        tool_call_id=call_id,
+        tool_name=tool_name,
+        result=result,
+        duration_ms=5,
+        **extra,
+    )
+
+
+def _tool_ok_by_call(call_id):
+    import hermes_telemetry.db as tdb
+
+    rows = (
+        tdb._get_conn()
+        .execute("SELECT ok FROM tool_calls WHERE tool_call_id = ?", (call_id,))
+        .fetchall()
+    )
+    return [r["ok"] for r in rows]
+
+
+@pytest.mark.parametrize(
+    "status, expected",
+    [
+        ("ok", 1),
+        ("error", 0),
+        ("blocked", 0),
+        ("cancelled", 0),
+        ("timeout", 0),
+        ("weird", 0),
+    ],
+)
+def test_post_tool_call_status_is_authoritative(monkeypatch, status, expected):
+    """status wins over the result body, and blocked keeps its row as a failure."""
+    ctx = _register_hooks(monkeypatch)
+    # A result that the legacy heuristic would call a failure for status=ok.
+    _fire_tool(ctx, call_id="c1", result='{"error": "boom"}', status=status)
+    assert _tool_ok_by_call("c1") == [expected]
+
+
+def test_post_tool_call_status_ok_overrides_failing_looking_result(monkeypatch):
+    ctx = _register_hooks(monkeypatch)
+    _fire_tool(ctx, call_id="c2", result='{"exit_code": 1, "error": null}', status="ok")
+    assert _tool_ok_by_call("c2") == [1]
+
+
+def test_post_tool_call_missing_status_falls_back_and_keeps_row(monkeypatch):
+    """Older Hermes passes no status: classify the result, never drop the row."""
+    ctx = _register_hooks(monkeypatch)
+    cases = {
+        "f1": ('{"output": "x", "exit_code": 0, "error": null}', 1),
+        "f2": ('{"output": "x", "exit_code": 1, "error": null}', 0),
+        "f3": ('{"error": "x"}', 0),
+        "f4": ("plain text", 1),
+        "f5": ('{"output": "", "exit_code": -1, "error": null, "status": "degraded"}', 0),
+    }
+    for call_id, (result, _) in cases.items():
+        _fire_tool(ctx, call_id=call_id, result=result)
+    for call_id, (_, expected) in cases.items():
+        assert _tool_ok_by_call(call_id) == [expected], call_id
+
+
+def test_post_tool_call_none_status_uses_fallback(monkeypatch):
+    ctx = _register_hooks(monkeypatch)
+    _fire_tool(ctx, call_id="n1", result='{"exit_code": 2}', status=None)
+    assert _tool_ok_by_call("n1") == [0]

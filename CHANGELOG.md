@@ -101,6 +101,20 @@ if installed but not enabled. Previously it always printed the `enable` verb
 (which fails for not-installed profiles). JSON output and status collection
 unchanged. Tests added for both branches and a mixed case.
 
+### Fixed — tool outcome trusts the runtime `status` (#120, #116)
+
+- `post_tool_call` now records `ok` from the `status` kwarg Hermes core passes
+  (`"ok"` / `"error"` / `"blocked"` / `"cancelled"` / `"timeout"`, see
+  `agent/tool_executor.py`). Anything other than `"ok"` records `ok=0` and keeps
+  its row. Previously `_is_tool_ok` treated the mere presence of an `error` key
+  as failure, so every successful `terminal` call (always
+  `{"error": null, ...}`) was recorded `ok=0`.
+- Hermes builds that predate `status` fall back to a classifier that
+  approximates core's derivation: truthy `error`, non-zero `terminal`
+  `exit_code`, or `success: false` fail; the row is never dropped. No schema
+  change.
+- Thanks to @cloudsea35 for the original diagnosis and fix direction in #116.
+
 ### Fixed — throttled hot-path hook error logging
 
 `pre_tool_call` / `post_tool_call` / `pre_llm_call` fire on every tool call, and
