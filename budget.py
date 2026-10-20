@@ -112,7 +112,7 @@ _config_lock = threading.Lock()
 # next call retries as soon as the file's (st_ino, st_mtime_ns, st_size)
 # changes — mirroring the pricing.yaml fix in #134. Pinning a failed read used
 # to disable enforcement for the rest of the process's life.
-_load_failure_sig: tuple | None = None
+_load_failure_sig: tuple[int, int, int] | None = None
 _load_failure_warned: bool = False
 
 
@@ -304,14 +304,18 @@ def load_config() -> dict:
             return cfg
         _load_failure_sig = None
         if path.exists():
+            # Signature BEFORE the read, and OUTSIDE the try: the failure branch below
+            # records it, so it has to be bound even when the first statement inside the
+            # try raises (the `import yaml` is the obvious case). Capturing it inside the
+            # try made `_load_failure_sig = sig` raise UnboundLocalError out of
+            # load_config() — which sits on the pre_tool_call path and must never raise.
+            # A post-failure stat would be wrong anyway: a concurrent writer that
+            # atomically replaces the file mid-parse would hand us the good replacement's
+            # signature and pin the instance to the empty table forever.
+            sig = _file_signature(path)
             try:
                 import yaml
 
-                # Signature BEFORE the read: if a concurrent writer atomically
-                # replaces the file mid-parse, a post-failure stat would record
-                # the good replacement's signature and pin the instance to the
-                # empty table forever.
-                sig = _file_signature(path)
                 with open(path) as f:
                     raw = yaml.safe_load(f) or {}
                 cfg["budgets"] = raw.get("budgets") or {}

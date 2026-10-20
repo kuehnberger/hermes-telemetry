@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import builtins
 import os
+import sys
 import textwrap
 from pathlib import Path
 
@@ -114,6 +115,36 @@ def test_failure_streak_logs_warning_once(tmp_path, caplog):
     debugs = [r for r in caplog.records if r.levelno == 10]  # logging.DEBUG
     assert len(warnings) == 1
     assert any("Failed to load budget config" in r.message for r in debugs)
+
+
+def test_pre_read_failure_is_recorded_and_load_config_never_raises(tmp_path, monkeypatch):
+    """A failure BEFORE the read must be recorded, not escape as UnboundLocalError.
+
+    ``sig`` is captured outside the ``try`` for exactly this case. With it inside, a raising
+    ``import yaml`` reached the ``except`` branch with ``sig`` still unbound, so
+    ``_load_failure_sig = sig`` raised UnboundLocalError *out of* ``load_config()`` — which
+    sits on the ``pre_tool_call`` path and must never raise.
+    """
+    _write_raw_budget(tmp_path, VALID_BUDGET)
+
+    # ``import yaml`` inside load_config resolves through sys.modules, so None there makes it
+    # raise ImportError — the very first statement inside the try fails.
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    assert budget.load_config()["budgets"] == {}  # the point: no exception
+
+    # The failure was recorded, so the unchanged file is not re-opened (one stat per call).
+    budget_file = _budget_path(tmp_path)
+    opened: list[str] = []
+    real_open = builtins.open
+
+    def counting_open(file, *args, **kwargs):
+        if Path(file) == budget_file:
+            opened.append(str(file))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+    assert budget.load_config()["budgets"] == {}
+    assert opened == []
 
 
 def test_reload_config_clears_failure_streak(tmp_path):
