@@ -169,13 +169,18 @@ pre_api_request         Stash approx_input_tokens keyed by (session_id, call_cou
 
 post_api_request        PRIMARY TOKEN SOURCE. One call per individual API call
                         within a turn. Carries the usage dict with real token
-                        counts. Calculates cost, records llm_calls row, updates
+                        counts. Calculates cost, records llm_calls row (incl.
+                        turn_id / task_id / api_request_id, schema v18), updates
                         runs totals.
 
-api_request_error       Captures 404 "model removed / unavailable" errors to
-                        power the model-unavailable alert. NO token data.
+api_request_error       (1) Records EVERY API failure per attempt in the
+                        llm_call_errors ledger — any status, retryable or not
+                        (schema v18). (2) Captures 404 "model removed /
+                        unavailable" errors to power the model-unavailable
+                        alert. NO token data.
 
-post_tool_call          Records tool name, success/failure, latency. Also records
+post_tool_call          Records tool name, success/failure, latency, and (v18)
+                        the turn_id + tool_call_id it belongs to. Also records
                         a proxy row for delegate_task/subagent calls (no token
                         data there, just a count).
 
@@ -269,15 +274,17 @@ Fires before each individual API call. `approx_input_tokens` is used only as a
 fallback estimator when `usage=None` in `post_api_request`.
 
 ### `post_api_request`  ← PRIMARY hook for tokens/cost/latency
-Source: `agent/conversation_loop.py:3463-3482`
+Source: `agent/turn_response_intake.py::_fire_post_api_request_hook`
 ```python
-task_id: str
+task_id: str              # v18: persisted
 session_id: str
 platform: str
 model: str
 provider: str             # verbatim from gateway — NOT normalized
 api_call_count: int
 api_duration: float       # seconds; multiply by 1000 for ms
+turn_id: str              # v18: persisted
+api_request_id: str       # v18: persisted
 finish_reason: str
 response_model: str       # model name as reported by the provider response
 usage: dict | None        # CanonicalUsage (see below) or None when unavailable
@@ -308,19 +315,28 @@ to avoid double-counting. `prompt_tokens = input + cache_read + cache_write`, so
 using it plus the individual components would count them twice.
 
 ### `post_tool_call`
-Source: `model_tools.py:994-1005`
+Source: `model_tools.py::_emit_post_tool_call_hook`
 ```python
 tool_name: str
 args: dict
 result: str        # JSON string (or plain text) returned by the tool
 task_id: str
 session_id: str
-tool_call_id: str
+tool_call_id: str  # v18: persisted (NULL for the subagent_stop proxy row)
+turn_id: str       # v18: persisted
+api_request_id: str
 duration_ms: int
+status: str        # "ok" / "error" / ... — derived from result when not given
+error_type: str
+error_message: str
+middleware_trace: list[dict]
 ```
 Success/failure detection: attempt `json.loads(result)` and check for an
 `"error"` key. If that fails (not valid JSON), fall back to
 `result.startswith('{"error"')`. This is robust to tools that return plain text.
+*(Not consumed yet — see `§ Turn identity and the failure ledger` for the v18
+columns that are. `status`/`error_type`/`error_message` on the tool row remain a
+deliberate non-goal of that change.)*
 
 ### `on_session_end`
 Source: `agent/conversation_loop.py:4692-4700`
@@ -443,11 +459,108 @@ table before applying.
 | v15 | `pricing_snapshots.resolved_model` — Canonical model name captured when a dated id was normalized to resolve against the core `/models` catalog; NULL when the raw name resolved directly. |
 | v16 | New tables: `endpoint_payload_cache` and `model_efficiency_cache` for standalone-dashboard caches; cache writers share the plugin DB's WAL + 30s busy-timeout posture. |
 | v17 | Data-only repair (issue #89): deletes `known_free_models` rows with no evidence of being genuinely free (no wildcard `provider=''`, and no `llm_calls` row for the same model+provider with `cost_usd = 0` AND tokens > 0), plus their `free_paid_transitions` rows. No shape change. |
+| v18 | Turn identity + failure ledger. `llm_calls`: `turn_id`, `task_id`, `api_request_id`. `tool_calls`: `turn_id`, `tool_call_id`. New table `llm_call_errors` (+ `idx_llm_call_errors_session`), plus `idx_llm_turn` on `llm_calls(turn_id)` and `idx_tool_turn` on `tool_calls(turn_id)` — the two query shapes turn identity exists for. See `§ Turn identity and the failure ledger`. |
 
 `_SCHEMA_VERSION` in `db.py` is the latest applied version — keep it in lockstep
 with the highest `_migrate_vN`. `test_schema_idempotent` asserts the count of
 `schema_version` rows equals `_SCHEMA_VERSION`, so adding a migration without
 bumping the constant (or vice versa) fails CI.
+
+### Turn identity and the failure ledger (schema v18)
+
+Two related additions, both fed by hooks that already fired — no new hook, no new
+LLM call, no content capture.
+
+**1. Turn identity on the observation rows.** `turn_id`
+(`{session_id}:{task_id}:{8hex}`, built in `agent/turn_context.py`) has always
+been on every per-call hook payload; the plugin stored it only in
+`subagent_edges.parent_turn_id`. v18 persists it (plus `task_id` and
+`api_request_id` on `llm_calls`, and `tool_call_id` on `tool_calls`) so a turn's
+calls and tools are recoverable with a plain `GROUP BY turn_id`:
+
+```sql
+SELECT turn_id, COUNT(*), SUM(cost_usd), SUM(tokens_in + tokens_out)
+FROM llm_calls WHERE session_id = ? GROUP BY turn_id;
+```
+
+Deliberately **no materialized rollup table**: per-turn aggregation is a query,
+not a write path. All five columns are nullable and historical rows keep NULL —
+turn ids were never captured for them, and NULL is the honest value. Empty
+turn ids from the host are normalised to NULL by the handlers (`turn_id or
+None`); the ledger's text columns (`model`, `provider`, `error_type`,
+`error_message`, `reason`) store `''` when the payload omits them.
+
+The delegation tree joins on the same key:
+
+```sql
+SELECT se.child_session_id, lc.turn_id
+FROM subagent_edges se JOIN llm_calls lc ON lc.turn_id = se.parent_turn_id;
+```
+
+**Assert the precondition before reading that join as a health check.**
+`parent_turn_id` is populated on only *some* edges (2 of the 4 rows in the live
+dataset at v0.9.0); an edge whose `parent_turn_id` is `''` can never join, so a
+bare `COUNT(*)` over every edge is a false negative, not a pass. Filter the left
+side (`WHERE se.parent_turn_id > ''`) — `> 0` is not valid for a TEXT column.
+
+**2. Per-call failure ledger (`llm_call_errors`).** `llm_calls` only ever saw the
+success path; failures were reduced to the 404-class aggregate in
+`model_unavailable_alerts` (keyed model+provider, no session, no per-attempt
+row). v18 adds an append-only ledger written from `api_request_error` for
+**every** firing — any status, retryable or not — *before* the 404-specific
+branch. One row per failed **attempt**: no dedupe, N attempts → N rows.
+
+The two writes for a 404 are intentional: history (`llm_call_errors`) **and** the
+alert (`model_unavailable_alerts` + the one-shot `pre_llm_call` injection). The
+alert's filter, upsert, and queueing are unchanged.
+
+**Retention: this table has no cap and no prune.** One row per failed attempt
+means a 429 retry storm, or a cron job failing auth on every run, grows
+`llm_call_errors` without bound — on a long-lived instance it accumulates rows
+faster than any other table the plugin writes. Left deliberate for now: the
+ledger exists to make failures visible, and choosing what to discard (and
+whether the answer differs for 429 vs auth vs 404, or should be a count rather
+than an age) is its own decision rather than something to guess at in the same
+change that adds the table. Tracked as a follow-up; until it lands, pruning is
+yours:
+
+```sql
+DELETE FROM llm_call_errors WHERE ts < '2026-01-01T00:00:00+00:00';
+```
+
+**Read the payload as it actually arrives.** The emitter
+(`agent/api_request_hooks.py::_invoke_api_request_error_hook`) sends:
+
+```python
+error   = {"type": error_type, "message": error_message}   # not top-level
+request = {"method": "POST", "body": {...api kwargs...}}   # model in body["model"]
+api_duration                                           # SECONDS, not ms
+```
+
+There is no top-level `error_type` / `error_message` / `api_kwargs` /
+`api_start_time`. The handler declares the flat names anyway **as a fallback**
+so an older host keeps working, but reads the nested dict first — reading only
+the flat names is what made the pre-v18 404 path store an empty
+`model_unavailable_alerts.error_message` for a live-shaped 404. `error_message`
+is truncated to 500 chars at the write boundary (`db.record_llm_call_error`), so
+every caller inherits the bound the column advertises.
+
+Two payload-integrity rules in that handler, both easy to break:
+
+- **`api_duration` is untrusted input.** A non-finite float (`inf` / `nan`) or a
+  non-numeric string raises in `float()` / `round()`. Converted outside the
+  ledger's own `try` it killed the ledger row **and** the 404 alert — a failure
+  that leaves no trace, the class this table exists to close. The conversion has
+  its own `except (TypeError, ValueError, OverflowError)` and leaves
+  `duration_ms` NULL, which is the honest value for a duration we could not read.
+- **`retryable` defaults to `None`, and the 404 alert guard is
+  `if retryable is not False:`** — not truthiness. `None` means "the host did
+  not say" and is stored as NULL, not 1: a 1 asserts a classification the
+  payload never made. The guard has to be written that way: with the default
+  `None`, `if retryable:` is falsy for unknown, so the alert would fire on every
+  unclassified 404. `is not False` leaves the alert identical for every payload
+  that states the field (True → no alert, False → alert) and keeps unknown out
+  of the alert path exactly as the old `True` default did.
 
 ### Adding a column or table — mandatory checklist
 
@@ -740,6 +853,56 @@ Cache prices are derived from multipliers when not explicit:
 sets it back to `None`, forcing the next read to re-parse the YAML. This is
 called by the auto-refresh cycle and by the `/setup` command, so new prices
 take effect immediately without a gateway restart.
+
+**A read/parse failure is never memoized — but IS stat-gated (issue
+#105/#106).** `_load_custom_pricing()` treats "file missing" and "file
+present but unreadable/unparseable" as the same kind of failure state,
+unified under one mechanism. On EITHER failure it returns the empty
+fallback table for that call only and leaves `_custom_pricing` as `None` —
+so, unlike a successful parse, a failure is never pinned into the permanent
+cache. Pinning it used to silently drop every custom override — in
+particular a `_subscription: true` flat-rate entry — for the rest of that
+plugin instance's process life. This does **not** zero out cost:
+`pricing.yaml` sits ABOVE the built-in/prefix table in the lookup priority
+chain (see § Pricing Engine above), not below, so an overridden model
+instead falls through to core-snapshot/built-in/prefix pricing and gets
+billed at list rate instead of its pinned rate — the #106 mis-billing
+symptom. A *successful* parse still memoizes exactly as before, so
+`test_cache_is_stale_until_reload` (a stale read until an explicit
+`reload_custom_pricing()`) is unaffected.
+
+Naively retrying the file on every single call would reintroduce a
+different cost: `estimate_cost()` runs on the hot path (every tool call), so
+a persistently broken or missing file would pay an open()+parse() (or even
+just a re-`stat()`) on every one of them. Instead, on a failure
+`_load_custom_pricing()` records the file's stat signature —
+`_pricing_load_failure_sig = None` for "missing", else
+`(st_ino, st_mtime_ns, st_size)` — in `_pricing_load_failed`/`_pricing_load_failure_sig`.
+The signature is captured **before** the `open()`, not after the failed
+parse: if a concurrent writer atomically replaces the file mid-parse, a
+post-failure `stat()` would record the *good* replacement's signature and
+pin the instance to the empty table forever. The inode is part of the
+signature because every `os.replace` commit yields a new one, even when
+`mtime_ns` and size collide with the file it replaced.
+The next call, while still in a failure streak, `stat()`s the file and
+compares: if the signature is unchanged, it returns the fallback
+immediately without opening or parsing anything; only a real change (file
+appeared, disappeared, or was rewritten) triggers an actual retry. This is
+also what makes a missing-then-later-created file (or a corrupt file that
+gets fixed) pick up correctly with no explicit reload — the changed
+signature falls through to a real parse attempt. `reload_custom_pricing()`
+additionally clears `_pricing_load_failed`/`_pricing_load_failure_sig`
+directly, so an explicit reload always forces a real attempt even in the
+unlikely case the file's signature happens to be unchanged from the last
+recorded failure.
+
+Since a genuine retry only happens when something changed, a persistently
+broken file (same content) logs nothing at all past the first failure — the
+signature-match short-circuit returns before any log call. Only a REAL
+retry that still fails logs anything, and even then only once per failure
+streak: WARNING on the first real failure, DEBUG on any later one, both
+tracked via `_pricing_load_failed_warned` and reset by the next successful
+parse.
 
 ### Core-sourced pricing snapshots
 
@@ -1137,6 +1300,45 @@ models via `estimated_price_share()` and degrades hard verdicts under `warn_only
 The 24h refresh cadence is tracked via a sentinel file at
 `~/.hermes/telemetry/.pricing_refresh`. Touch it to force a refresh on next
 plugin load. Delete it to trigger auto-refresh.
+
+### Atomic write (issue #105/#106)
+
+Under Hermes multiplex, one gateway process runs N plugin instances (one per
+served profile), all sharing the same `pricing.yaml` and all running their own
+auto-refresh cycle. `pricing_refresh._atomic_write_text()` writes to a temp
+file in the same directory, flushes + fsyncs, then commits via `os.replace`
+(POSIX-atomic rename) — a concurrent reader in another instance only ever
+sees the old content or the new content in full, never a truncated/partial
+file. `_save_yaml()` (the auto-refresh writer) builds on it and keeps its
+existing fail-open contract (logs and returns on error, never raises).
+`pricing_drift.py`'s `--apply` writer and `setup_wizard.py`'s first-run writer both
+route through the same primitive — the former still propagates a write
+failure to the CLI (unchanged), the latter still propagates to `/setup`'s
+caller (unchanged).
+
+**Symlinks are followed, not replaced.** `_atomic_write_text()` resolves
+`path` with `os.path.realpath` first and uses the resolved target for the
+mode lookup, the temp file's directory and the `os.replace`. Without that,
+a symlinked `pricing.yaml` (e.g. into a dotfiles repo) would be swapped for a
+regular file and the real target left untouched.
+
+**Permissions are preserved, not reset to `mkstemp`'s default.**
+`tempfile.mkstemp()` creates its file `0600` — if that mode rode along into
+the replace it would silently tighten `pricing.yaml` from `open(path, "w")`'s
+usual `0o666 & ~umask` (typically `0644`), breaking read access for e.g. a
+dashboard running as another user. `_atomic_write_text()` `chmod`s the temp
+file (`os.fchmod` on the open fd, done *inside* the `with os.fdopen(fd, "w")`
+block so the fd is guaranteed closed even if `fchmod` itself raises — doing
+it before the `with` would leak the fd on that path): to the existing
+target's mode when one is already there, otherwise to `0o666` masked by the
+umask captured once at module import (`_DEFAULT_FILE_MODE`). That umask is
+read via `_read_process_umask()`, which parses the `Umask:` field from
+`/proc/self/status` (falling back to `0o022` when unavailable) rather than
+calling `os.umask()` — `os.umask()` has no read-only form, it always *sets*
+the process-wide umask while returning the old value, which would be unsafe
+to call at arbitrary import time in a long-running multithreaded gateway
+process (import can happen mid-uptime, racing another thread's file
+creation).
 
 ---
 
@@ -1705,6 +1907,9 @@ Enable with `git config core.hooksPath .githooks`.
 - `runs.parent_session_id` stays dormant by design — `subagent_edges` is the
   persistent, single source of truth for the delegation tree, so there is no
   need to populate the column retroactively.
+- Since v18 the parent side of an edge also joins to the parent's own calls
+  (`llm_calls.turn_id = subagent_edges.parent_turn_id`). Filter the left side
+  (`parent_turn_id > ''`) — see `§ Turn identity and the failure ledger`.
 - **Phase-1 boundary:** this is reporting/aggregation correctness only. A
   detached async child still self-enforces only against `global` while it
   runs; in-path enforcement that pauses a runaway child mid-flight is a
@@ -1842,7 +2047,7 @@ hermes telemetry sync-profiles --apply    # RUN FROM THE DEFAULT PROFILE (shared
 - `config.yaml` is **read-only**: the command warns when a profile has not enabled the plugin
   (`plugins.enabled`) but NEVER edits it. Auto-enable and plugin-symlinking were deliberately
   dropped — the repo has no comment-preserving YAML writer, and enabling is a one-line manual
-  step (`hermes plugins enable hermes-telemetry --profile <name>`).
+  step that sync-profiles prints correctly: `hermes plugins install hermes-telemetry -p <name> --enable` if not installed, else `hermes plugins enable hermes-telemetry -p <name>`.
 - **Non-default guard:** enumeration is default `~/.hermes` + `~/.hermes/profiles/*/`; the target
   defaults to the current resolved home (`HERMES_TELEMETRY_HOME` > `HERMES_HOME` > `~/.hermes`).
   If run from a named profile, `--apply` refuses unless `--yes` is passed — review the dry-run
@@ -1955,31 +2160,43 @@ print('api_request_error registered:', p.has_hook('api_request_error'))
 " 2>&1 | grep -E "Loading plugin 'hermes-telemetry'|api_request_error registered"
 ```
 
-### `api_request_error` — model-unavailable detection (issue #43)
+### `api_request_error` — failure ledger (v18) + model-unavailable detection (issue #43)
 
-Fires at the moment of a non-retryable client error from
-`agent/conversation_loop.py`, before the exception is diluted into the
-`RuntimeError` that surfaces in `cron.scheduler`. Verified kwargs:
+Fires at the moment of an API client error, before the exception is diluted into
+the `RuntimeError` that surfaces in `cron.scheduler`. Verified kwargs
+(`agent/api_request_hooks.py::_invoke_api_request_error_hook`):
 
 | kwarg            | Notes                                                                |
 |------------------|----------------------------------------------------------------------|
 | `session_id`     | The active session                                                   |
-| `api_kwargs`     | Dict; the requested model id lives in `api_kwargs["model"]`          |
-| `error_type`     | Exception class name, e.g. `"NotFoundError"` for a 404               |
-| `error_message`  | Full message including the status code and the model id              |
+| `task_id`, `turn_id`, `api_request_id`, `api_call_count` | Identity of the failed attempt (v18: persisted on the ledger row) |
+| `error`          | **Dict**: `{"type": "NotFoundError", "message": "…"}` — *not* top-level `error_type`/`error_message` |
+| `request`        | **Dict**: `{"method": "POST", "body": {...}}`; the requested model id is `request["body"]["model"]` — *not* the older flat `api_kwargs` |
+| `api_duration`   | Seconds (multiply by 1000 for ms) — *not* `api_start_time`           |
+| `started_at`, `ended_at` | Epoch seconds                                                 |
 | `status_code`    | HTTP status (404 for model-not-found)                                |
-| `retryable`      | False for 404s                                                       |
+| `retryable`      | `False` for 404s; may be `None` when unclassified                    |
 | `reason`         | Classifier enum, e.g. `"model_not_found"`                            |
-| `retry_count`, `max_retries`, `task_id`, `turn_id`, `api_request_id`, `api_call_count`, `api_start_time` | Other context fields, kept via `**_kw` |
+| `retry_count`, `max_retries` | Retry context on the ledger row                           |
+| `model`, `provider` | The agent's configured model/provider                             |
 
-The plugin filters to `status_code == 404 AND retryable is False` and:
+The handler does two independent jobs:
 
-1. Upserts `model_unavailable_alerts` keyed on `(model, provider)`. Repeated
-   404s bump `occurrences` and refresh `last_seen_at`; `first_seen_at` is
-   preserved.
-2. Queues a pending entry in `_pending_model_unavailable_alerts[session_id]`
-   so the next `pre_llm_call` injects a one-shot warning that names the
-   model, provider, status, and occurrence count.
+1. **Ledger (v18).** Writes one `llm_call_errors` row for *every* firing, before
+   any filtering — see `§ Turn identity and the failure ledger`.
+2. **Model-unavailable alert.** Filters to `status_code == 404 AND retryable is
+   False` and then:
+   - Upserts `model_unavailable_alerts` keyed on `(model, provider)`. Repeated
+     404s bump `occurrences` and refresh `last_seen_at`; `first_seen_at` is
+     preserved.
+   - Queues a pending entry in `_pending_model_unavailable_alerts[session_id]`
+     so the next `pre_llm_call` injects a one-shot warning that names the
+     model, provider, status, and occurrence count.
+
+The filter, upsert, queueing, and injected text of (2) are unchanged by v18 —
+only the *field reading* was corrected to the nested shape above (with the flat
+names kept as a fallback), which is why a live-shaped 404 previously stored an
+empty `model_unavailable_alerts.error_message`.
 
 Sibling to free→paid: same family of provider-side changes (deprecation,
 `:free` promo end) but the call fails entirely instead of just billing.

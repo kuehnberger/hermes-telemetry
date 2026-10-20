@@ -7,6 +7,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Schema v17 → v18.** One forward-only migration runs automatically on first
+  load. It adds `llm_calls.turn_id` / `task_id` / `api_request_id`,
+  `tool_calls.turn_id` / `tool_call_id`, and the new `llm_call_errors` table
+  (+ index). All five columns are nullable; **rows written before the upgrade
+  keep NULL** — their turn ids were never captured, and NULL is the honest
+  value. No backfill, no data rewrite, no rollup table.
+
+### Added — Turn identity on `llm_calls` / `tool_calls` (schema v18)
+
+- `turn_id` (`{session_id}:{task_id}:{8hex}`), `task_id` and `api_request_id`
+  are now persisted on every `llm_calls` row, and `turn_id` +
+  `tool_call_id` on every `tool_calls` row — all four were already on the hook
+  payloads and were simply dropped. Per-turn cost / latency / token totals are
+  now a `GROUP BY turn_id` query instead of a timestamp heuristic, and the
+  existing `subagent_edges.parent_turn_id` joins to the parent's own calls
+  (`SELECT … FROM subagent_edges se JOIN llm_calls lc ON lc.turn_id =
+  se.parent_turn_id` — filter `se.parent_turn_id > ''`: it is populated on only
+  some edges, so an unqualified count under-reports).
+- The `subagent_stop` proxy row (`delegate_task/subagent`) carries the parent
+  turn that delegated. Its `tool_call_id` stays NULL — a delegation has no
+  model-emitted tool call id.
+
+### Added — Per-call failure ledger `llm_call_errors` (schema v18)
+
+- Failed API attempts are recorded per call, not just as the 404-class aggregate
+  in `model_unavailable_alerts`: the `api_request_error` hook now writes one
+  `llm_call_errors` row for **every** firing — any status, retryable or not —
+  before the 404-specific branch. Attempt-level by design (N attempts → N rows,
+  no dedupe), so retry storms, 429/5xx/timeout/auth failures, and "how many
+  attempts did this call take" become answerable from the DB.
+- Columns: `session_id`, `ts`, `turn_id`, `task_id`, `api_request_id`,
+  `api_call_count`, `model`, `provider`, `status_code`, `error_type`,
+  `error_message` (≤500 chars), `retry_count`, `max_retries`, `retryable`,
+  `reason`, `duration_ms` + `idx_llm_call_errors_session(session_id, ts)`.
+- Row counts are not budget inputs: nothing else reads this table, and no
+  aggregate or alert behaviour changed.
+
+### Fixed — the `api_request_error` handler read the wrong payload shape
+
+- The handler declared top-level `api_kwargs` / `error_type` / `error_message` /
+  `api_start_time`, but the emitter (`agent/api_request_hooks.py`) sends the
+  error text nested as `error={"type", "message"}`, the request as
+  `request={"method", "body"}` (model in `body["model"]`), and the duration as
+  `api_duration` in **seconds**. Under live bytes those parameters resolved to
+  `""`, so the model-unavailable alert stored an **empty**
+  `error_message` for a real 404 and looked up the wrong kwarg for the model id.
+  The handler now reads the nested shape first with the flat names kept as a
+  fallback. The 404 alert's filter, upsert, queueing and injected wording are
+  otherwise unchanged — a live-shaped 404 now stores the real message.
+
+### Fixed — v18 review round (turn identity + failure ledger)
+
+- **`turn_id` now has the indexes its own queries need.** v18 shipped turn
+  identity but only `idx_llm_call_errors_session`, so the per-turn rollup
+  (`GROUP BY llm_calls.turn_id`) and the delegation join
+  (`subagent_edges.parent_turn_id = llm_calls.turn_id`) fell back to scanning
+  every `llm_calls` row a long-lived DB has accumulated. `idx_llm_turn`
+  (`llm_calls(turn_id)`) and `idx_tool_turn` (`tool_calls(turn_id)`) are created
+  in the same migration, and both migration tests now assert them by name **and**
+  by indexed column.
+- **A non-finite `api_duration` no longer silences the failure it accompanies.**
+  `float()` / `round()` raised on `inf` / `nan` / a non-numeric string *above*
+  the ledger's own guard, so the outer handler swallowed the entire firing: no
+  ledger row and no 404 alert — the silent-failure class the ledger exists to
+  close. (`1e300` raised later, at the SQLite int64 bind inside the ledger
+  guard, losing just the row.) The conversion has its own
+  `except (TypeError, ValueError, OverflowError)` and leaves `duration_ms` NULL.
+- **Unknown `retryable` is NULL, and the two surfaces now agree.** The handler's
+  `retryable` kwarg defaulted to `True`, so a payload that omitted the field
+  recorded `retryable = 1` — a classification it never made — while the guard
+  `if retryable:` kept a genuine non-retryable 404 out of the alert path. The
+  default is now `None` (the writer stores NULL) **and** the guard reads
+  `if retryable is not False:`; changing the default alone would make an unknown
+  falsy and fire the alert on every unclassified 404.
+
+The `retryable` and `api_duration` gaps were both found by a community reviewer.
+
+**Known, out of scope:** `__init__.py:383` (`latency_ms = int(api_duration * 1000)`)
+carries the same unguarded-coercion shape as the failure path fixed above. It is
+pre-existing on `main`, sits in the *success* path, and a non-finite `api_duration`
+there silently loses the `llm_calls` row and its `runs` totals. Deliberately not
+changed here — this change stays limited to the four requested items.
+
+### Fixed — sync_profiles repair hint branches on plugin install state (#132)
+
+The dry-run warning for profiles where the plugin is not enabled now prints the
+correct verb per profile: `hermes plugins install hermes-telemetry -p <name> --enable`
+if the plugin is not installed, or `hermes plugins enable hermes-telemetry -p <name>`
+if installed but not enabled. Previously it always printed the `enable` verb
+(which fails for not-installed profiles). JSON output and status collection
+unchanged. Tests added for both branches and a mixed case.
+
 ### Fixed — throttled hot-path hook error logging
 
 `pre_tool_call` / `post_tool_call` / `pre_llm_call` fire on every tool call, and
@@ -24,6 +118,18 @@ the Hermes core's 60s hook-timeout suppression window
 the two never beat against each other, and the per-exception-class key means a
 *different* failure raised inside the window is surfaced immediately rather
 than swallowed by the previous one's suppression.
+
+### Fixed — `pricing.yaml` atomic writes and failed-read caching (#105, #106)
+
+- **`pricing.yaml` overrides could be lost for the rest of a process's life (#105, #106).**
+  Under Hermes multiplex, several plugin instances in one gateway process share one
+  `pricing.yaml`, and a refresh rewrote it in place, so a concurrent reader could see an
+  empty or partial file. The loader then cached that failed read permanently, dropping
+  every override (including `_subscription: true` flat-rate entries) and billing those
+  models at list rate. Writes from the price refresh, `pricing drift --apply` and the
+  `/setup` wizard are now atomic (temp file + `os.replace`, existing permissions kept,
+  symlinked `pricing.yaml` followed rather than replaced), and a failed read is no longer
+  cached: the file is re-read as soon as it changes, with no reload needed.
 
 ## [0.9.1] - 2026-10-14
 
