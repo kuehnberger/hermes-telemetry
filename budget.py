@@ -116,85 +116,10 @@ _load_failure_sig: tuple[int, int, int] | None = None
 _load_failure_warned: bool = False
 
 
-def _read_process_umask() -> int:
-    """Return this process's umask WITHOUT mutating it.
-
-    ``os.umask()`` has no read-only form — calling it always SETS the
-    process umask while returning the old value. That's unsafe to call from
-    module import: import can happen mid-uptime in a long-running
-    multithreaded gateway process, and the brief window where the umask is
-    wrong would race any other thread creating a file at that exact moment.
-
-    Linux exposes the current umask as a read-only field in
-    ``/proc/self/status`` (octal, e.g. ``Umask:\\t0022``); this parses that
-    instead. Falls back to the common default ``0o022`` when the field is
-    unavailable (non-Linux, a sandboxed/restricted ``/proc``, or a
-    malformed line) — this function must never raise.
-    """
-    try:
-        with open("/proc/self/status") as f:
-            for line in f:
-                if line.startswith("Umask:"):
-                    return int(line.split(":", 1)[1].strip(), 8)
-    except (OSError, ValueError):
-        pass
-    return 0o022
-
-
-# Computed once at import time (not per-call, and via the non-mutating reader
-# above — see its docstring for why). Mirrors what ``open(path, "w")`` would
-# have produced for a brand-new file: 0o666 masked by the umask in effect at
-# process start.
-_DEFAULT_UMASK = _read_process_umask()
-_DEFAULT_FILE_MODE = 0o666 & ~_DEFAULT_UMASK
-
-
-def _atomic_write_text(path: Path, content: str) -> None:
-    """Write ``content`` to ``path`` atomically.
-
-    Writes to a temp file in the SAME directory, flushes + fsyncs, then
-    commits via ``os.replace`` (POSIX-atomic rename). A concurrent reader
-    therefore only ever sees the old content or the new content in full —
-    never a truncated/partial file (issue #135: under Hermes multiplex, N
-    plugin instances per process share one budget.yaml and race to write it,
-    and an out-of-process dashboard may edit it concurrently). The temp file
-    is removed if the write or the commit fails. Raises on failure — callers
-    decide their own fail-open/fail-loud policy.
-
-    Permissions: ``tempfile.mkstemp()`` creates its file ``0600`` — if that
-    mode rode along into the replace it would be a silent regression from
-    ``open(path, "w")``'s ``0o666 & ~umask`` (typically ``0644``), and a
-    dashboard running as another user would lose read access. The temp file
-    is ``chmod``'d before writing to match the target's existing mode when it
-    already exists, or the umask-derived default for a brand-new file.
-
-    Symlinks: if ``path`` is a symlink, ``os.replace`` onto it would swap the
-    link for a regular file and leave the real target untouched. The path is
-    therefore resolved first, and the mode lookup, the temp file's directory
-    and the replace all operate on the resolved target — the link survives and
-    the real file receives the new content.
-    """
-    target = Path(os.path.realpath(path))
-    target.parent.mkdir(parents=True, exist_ok=True)
-    mode = os.stat(target).st_mode & 0o777 if target.exists() else _DEFAULT_FILE_MODE
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"
-    )
-    try:
-        # fchmod happens INSIDE the fdopen `with` block (fd leak otherwise):
-        # if fchmod raised before the fd were wrapped by os.fdopen(), nothing
-        # would ever close it. Once wrapped, the `with` block's __exit__
-        # closes the fd on any exception raised inside it, fchmod included.
-        with os.fdopen(fd, "w") as f:
-            os.fchmod(f.fileno(), mode)
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_name, target)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.remove(tmp_name)
-        raise
+# The atomic-write primitive is shared with the pricing side (#134/#135): it lives
+# in ``pricing_refresh`` so there is exactly one implementation. Only the standalone
+# dashboard keeps a copy of its own — it cannot import plugin code (two-surface
+# rule) — and its parity against the shared helper is asserted behaviourally.
 
 
 def _file_signature(path: Path) -> tuple | None:
@@ -868,11 +793,16 @@ def _set_budget(scope: str, window: str, usd: float, scope_id: str = "") -> str:
         else:
             node.setdefault("default", {})[key] = usd
 
-    # Atomic write via _atomic_write_text (unique temp + fsync + os.replace,
-    # existing mode kept, symlink target followed) — see #135. Prevents a
+    # Atomic write via the shared primitive (unique temp + fsync + os.replace,
+    # existing mode kept, symlink target followed) — see #134/#135. Prevents a
     # concurrent reader (watchdog, another plugin instance, out-of-process
-    # dashboard) from ever parsing a partial file.
-    _atomic_write_text(path, yaml.safe_dump(raw, default_flow_style=False, sort_keys=False))
+    # dashboard) from ever parsing a partial file. Imported lazily, like
+    # setup_wizard.py does, so the plugin package's import order cannot bite.
+    from . import pricing_refresh
+
+    pricing_refresh._atomic_write_text(
+        path, yaml.safe_dump(raw, default_flow_style=False, sort_keys=False)
+    )
     reload_config()
     target = f"{scope} '{scope_id}'" if scope_id else scope
     return f"Set {target} {window} budget to ${usd:.2f}. Saved to {path}."

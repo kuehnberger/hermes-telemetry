@@ -154,8 +154,10 @@ than swallowed by the previous one's suppression.
   `setup_wizard._write_budget`, the dashboard budget edit) now route through
   an atomic writer (unique temp file + fsync + `os.replace`, existing mode
   kept, symlinked `budget.yaml` followed rather than replaced), mirroring
-  #134's `pricing.yaml` fix; the dashboard keeps a duplicated helper because
-  the standalone surface cannot import plugin code (parity test included).
+  #134's `pricing.yaml` fix — and it is the SAME shared primitive, so there is
+  one implementation on the plugin side; the dashboard keeps a duplicated helper
+  because the standalone surface cannot import plugin code (parity test
+  included).
   `load_config()` no longer memoizes a failed read: the failure is recorded
   as the file's stat signature captured before the read, and the next call
   retries as soon as the file changes — no `reload_config()` or restart

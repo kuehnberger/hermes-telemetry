@@ -1134,8 +1134,8 @@ thing this function must not do.
 `pricing.yaml` reads were given the same treatment, capturing the signature as
 `pre_read_sig` before the read. The two now behave identically on failure and
 differ on the missing-file case (a missing `pricing.yaml` still falls through to
-the bundled defaults). That pricing-side section — `### Atomic write (issue
-#105/#106)` — is added by #134.
+the bundled defaults). That pricing-side section — `### Atomic write (issue #105/#106)` — is
+added by #134.
 
 ### Anti-spam ledger (`budget_alerts` table)
 

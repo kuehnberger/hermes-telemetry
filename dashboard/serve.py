@@ -93,7 +93,7 @@ _DEFAULT_FILE_MODE = 0o666 & ~_DEFAULT_UMASK
 def _atomic_write_text(path: Path, content: str) -> None:
     """Write ``content`` to ``path`` atomically: temp file in the same
     directory, fsync, ``os.replace`` commit, existing mode kept, symlink
-    target followed. Mirrors ``budget._atomic_write_text`` (issue #135) —
+    target followed. Mirrors ``pricing_refresh._atomic_write_text`` (issue #135) —
     duplicated here because the standalone dashboard cannot import plugin
     code; behavioral parity is asserted by
     tests/test_dashboard.py::test_atomic_write_text_parity_with_plugin."""

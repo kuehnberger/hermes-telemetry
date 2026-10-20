@@ -1442,14 +1442,14 @@ def test_model_efficiency_sql_uses_window_filter(tmp_path, serve_module, monkeyp
 
 def test_atomic_write_text_parity_with_plugin(serve_module, tmp_path):
     """serve.py's duplicated _atomic_write_text must behave like the plugin's
-    budget._atomic_write_text: content round-trip, mode preservation, symlink
+    pricing_refresh._atomic_write_text: content round-trip, mode preservation, symlink
     following, temp cleanup. The standalone dashboard cannot import plugin
     code (two-surface rule), so parity is asserted behaviorally."""
-    import hermes_telemetry.budget as budget
+    import hermes_telemetry.pricing_refresh as pricing_refresh
 
     helpers = (
         ("standalone", serve_module._atomic_write_text),
-        ("plugin", budget._atomic_write_text),
+        ("plugin", pricing_refresh._atomic_write_text),
     )
     for name, helper in helpers:
         target = tmp_path / name / "budget.yaml"

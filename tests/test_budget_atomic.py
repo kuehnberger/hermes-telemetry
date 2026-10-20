@@ -15,6 +15,7 @@ import textwrap
 from pathlib import Path
 
 import hermes_telemetry.budget as budget
+import hermes_telemetry.pricing_refresh as pricing_refresh
 import pytest
 import yaml
 
@@ -207,7 +208,7 @@ def test_concurrent_writers_never_share_temp(tmp_path):
     def worker(n: int) -> None:
         try:
             for i in range(25):
-                budget._atomic_write_text(target, f"budgets: {{}} # {n}-{i}\n")
+                pricing_refresh._atomic_write_text(target, f"budgets: {{}} # {n}-{i}\n")
         except Exception as e:  # noqa: BLE001 - record, don't raise in thread
             errors.append(e)
 
@@ -223,13 +224,36 @@ def test_concurrent_writers_never_share_temp(tmp_path):
     assert leftovers == []
 
 
+def test_budget_writes_through_the_shared_atomic_helper(monkeypatch, tmp_path):
+    """budget.py must not carry its own copy of the primitive (#140 review item 2).
+
+    #134 landed the pricing-side helper and the plugin side now shares it, so there is
+    one implementation and one place to fix. The standalone dashboard keeps its own copy
+    (it cannot import plugin code) and its parity is asserted separately.
+    """
+    calls: list[Path] = []
+    real = pricing_refresh._atomic_write_text
+
+    def spy(path, content):
+        calls.append(Path(path))
+        real(path, content)
+
+    monkeypatch.setattr(pricing_refresh, "_atomic_write_text", spy)
+    _write_raw_budget(tmp_path, VALID_BUDGET)
+
+    budget._set_budget("global", "daily", 12.5)
+
+    assert calls, "budget did not write through the shared atomic helper"
+    assert calls[-1].name == "budget.yaml", calls
+
+
 def test_atomic_write_text_roundtrip_and_mode(tmp_path):
     target = tmp_path / "sub" / "file.txt"  # parent does not exist yet
-    budget._atomic_write_text(target, "hello")
+    pricing_refresh._atomic_write_text(target, "hello")
     assert target.read_text() == "hello"
 
     os.chmod(target, 0o640)
-    budget._atomic_write_text(target, "hello world")
+    pricing_refresh._atomic_write_text(target, "hello world")
     assert target.read_text() == "hello world"
     assert target.stat().st_mode & 0o777 == 0o640
     assert [p.name for p in target.parent.iterdir() if p.name.endswith(".tmp")] == []
@@ -243,7 +267,7 @@ def test_atomic_write_text_failure_cleans_up(tmp_path, monkeypatch):
 
     monkeypatch.setattr(budget.os, "replace", boom)
     with pytest.raises(OSError, match="disk gone"):
-        budget._atomic_write_text(target, "hello")
+        pricing_refresh._atomic_write_text(target, "hello")
     assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
     assert not target.exists()
 
