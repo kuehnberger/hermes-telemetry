@@ -326,17 +326,39 @@ tool_call_id: str  # v18: persisted (NULL for the subagent_stop proxy row)
 turn_id: str       # v18: persisted
 api_request_id: str
 duration_ms: int
-status: str        # "ok" / "error" / ... — derived from result when not given
+status: str        # "ok" / "error" / "blocked" / "cancelled" / "timeout"; ABSENT on Hermes builds before core 0d9b7132 (~2026-06-03)
 error_type: str
 error_message: str
 middleware_trace: list[dict]
 ```
-Success/failure detection: attempt `json.loads(result)` and check for an
-`"error"` key. If that fails (not valid JSON), fall back to
-`result.startswith('{"error"')`. This is robust to tools that return plain text.
-*(Not consumed yet — see `§ Turn identity and the failure ledger` for the v18
-columns that are. `status`/`error_type`/`error_message` on the tool row remain a
-deliberate non-goal of that change.)*
+Success/failure detection (`ok` on the `tool_calls` row):
+1. **`status` present** (current Hermes): `ok = (status == "ok")`. Core emits
+   `"ok"`, `"error"`, `"blocked"`, `"cancelled"` and `"timeout"`
+   (`agent/tool_executor.py`; `model_tools.py::_emit_post_tool_call_hook`).
+   Anything other than `"ok"` (including an unknown future value) records
+   `ok=0` and **keeps its row**. `"blocked"` covers every pre-dispatch guard:
+   plugin `pre_tool_call` blocks, scope/policy blocks, pruned-args rejection and
+   ACP edit-approval denial.
+2. **`status` missing/None** (pre-`0d9b7132` Hermes only): `_is_tool_ok(result,
+   tool_name)` *approximates* core's `_tool_result_observer_fields` /
+   `agent/display.py::_detect_tool_failure`: non-str, non-JSON and non-dict JSON
+   results are ok; a **truthy** `error` fails; `terminal` with `exit_code` not
+   in `(None, 0)` fails; `success is False` fails. The row is never dropped for
+   lack of `status`. Known gaps vs `_detect_tool_failure` (fallback only):
+   `user_summary` is not treated as a failure; core's `"error"` / `"failed"` /
+   `Error` string heuristic is not replicated; and a bare `{"success": false}`
+   fails here whereas core also needs an `error`/`message` key.
+
+Core's own `status` can still flag a non-terminal result carrying `"error": null`
+as `error` via that string heuristic in `_detect_tool_failure`; we trust core
+regardless.
+
+Gotcha (#120): the *presence* of an `error` key is not a failure. The foreground
+`terminal` result is always `{"output", "exit_code", "error": null}` —
+`tools/terminal_tool_result.py:258` — so a failed command has `error: null` and
+only `exit_code` signals it. The old key-presence check recorded every
+successful terminal call as failed. `error_type`/`error_message` are still not
+persisted on the tool row.
 
 ### `on_session_end`
 Source: `agent/conversation_loop.py:4692-4700`
@@ -1839,7 +1861,7 @@ the real `~/.hermes/telemetry`. Enforced by
 | Platform | ✅ Real | `on_session_start.platform` |
 | Cron job ID | ✅ Real (parsed) | `session_id` regex extraction |
 | Session duration | ✅ Real (wall time) | `started_at` → `ended_at` (last turn) |
-| Tool success/failure | ✅ Real | Parse `result` JSON for `"error"` key |
+| Tool success/failure | ✅ Real | `post_tool_call.status`; result-JSON fallback (truthy `error`, terminal `exit_code`, `success is False`) on older Hermes |
 | Subagent count | ✅ Real (proxy) | `subagent_stop` hook count |
 | Cost (USD) | ⚠️ Estimated | Local pricing table × token counts |
 | Tokens when `usage=None` | ⚠️ Estimated, flagged | `approx_input_tokens + chars/4`, row marked `estimated=1` |
