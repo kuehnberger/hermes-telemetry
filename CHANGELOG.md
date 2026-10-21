@@ -46,6 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Row counts are not budget inputs: nothing else reads this table, and no
   aggregate or alert behaviour changed.
 
+### Fixed — per-profile budgets in the status JSON and the standalone dashboard (#70)
+
+- `hermes-telemetry budget --json` now includes a `profiles` section (profile id →
+  verdict or `null`), mirroring `cron_jobs` / `senders` and the `Profiles:` block
+  the chat `/budget` status already shows. Profiles are enumerated from runs in the
+  last 30 days, like the other scopes.
+- The standalone dashboard budget panel now lists one row per profile seen in
+  `runs` that resolves to a `per_profile` limit (override replaces default, as in
+  the budget engine). These rows are read-only: the edit modal only handles
+  global scopes, so they render without an Edit button.
+
 ### Fixed — the `api_request_error` handler read the wrong payload shape
 
 - The handler declared top-level `api_kwargs` / `error_type` / `error_message` /

@@ -1136,6 +1136,15 @@ thing this function must not do.
 differ on the missing-file case (a missing `pricing.yaml` still falls through to
 the bundled defaults). See `### Atomic write (issue #105/#106)` below.
 
+The `--json` status (`telemetry_cli._budget_json`) enumerates the same three id
+lists and emits `cron_jobs` / `senders` / `profiles` as objects keyed by id —
+always present, possibly empty. The standalone dashboard's `api_budget` is the
+exception: it lists every profile ever seen in `runs` (no 30-day cutoff) and
+emits a row only when `per_profile` resolves a limit for it. Those rows carry a
+`scope_id` and are read-only in the panel — `api_budget_detail` /
+`api_budget_update` accept only `ALLOWED_SCOPES`, so `renderBudget` omits the
+Edit button for them.
+
 ### Anti-spam ledger (`budget_alerts` table)
 
 Soft alerts fire **once per window per scope** — not on every `pre_llm_call`.

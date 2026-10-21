@@ -518,6 +518,18 @@ def test_api_budget_surfaces_per_profile_budgets(serve_module, tmp_path):
     assert "global/daily" in by_scope
 
 
+def test_budget_panel_edit_button_skips_per_profile_rows():
+    """Per-profile rows are read-only in the standalone panel: the edit modal
+    (api_budget_detail / api_budget_update) only accepts ALLOWED_SCOPES, so an
+    Edit button on a "profile:<name>/<window>" row opens a modal that errors."""
+    html = (Path(__file__).parent.parent / "dashboard" / "index.html").read_text(encoding="utf-8")
+    start = html.index("function renderBudget(data)")
+    body = html[start : html.index("\nfunction ", start + 1)]
+    edit_btn = body.index("budget-edit-btn")
+    gate = body.rfind("s.scope_id", 0, edit_btn)
+    assert gate != -1, "renderBudget must gate the Edit button on s.scope_id"
+
+
 def test_budget_detail_restores_default_thresholds(serve_module, tmp_path):
     import sqlite3
 
