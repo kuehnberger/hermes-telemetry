@@ -73,7 +73,7 @@ CRON_OUTPUT_DIR = HERMES_HOME / "cron" / "output"
 
 def _read_process_umask() -> int:
     """Return this process's umask WITHOUT mutating it (parses /proc/self/status
-    on Linux, falls back to 0o022). Mirrors budget._read_process_umask — the
+    on Linux, falls back to 0o022). Mirrors ``pricing_refresh._read_process_umask`` — the
     standalone dashboard shares no code with the plugin package (two-surface
     rule, tests/test_dashboard_plugin_isolation.py)."""
     try:
