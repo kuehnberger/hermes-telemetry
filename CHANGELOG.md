@@ -163,6 +163,18 @@ than swallowed by the previous one's suppression.
   retries as soon as the file changes — no `reload_config()` or restart
   needed. A missing `budget.yaml` still means budgets are disabled.
 
+### Added — `hermes telemetry pricing recalculate` (#83)
+
+- **Historical costs stayed frozen after a pricing correction.** `pricing drift
+  --apply` rewrites `pricing.yaml` with corrected rates, but `llm_calls.cost_usd`
+  rows written earlier kept their old-price values, so the dashboard mixed
+  old-price and new-price spend and budget tracking drifted. The new
+  `pricing recalculate` subcommand recomputes `cost_usd` for every row that was
+  explicitly priced at record time (`estimated = 0 AND provider_assumed = 0`)
+  against the current `pricing.yaml`, refreshes the per-run rollup, and is
+  dry-run by default (`--apply` to write). Rows whose model no longer resolves
+  to an explicit price are skipped and reported, never zeroed.
+
 ## [0.9.1] - 2026-10-14
 
 ### Fixed
