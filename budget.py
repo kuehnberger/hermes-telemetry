@@ -105,6 +105,37 @@ _WINDOWS = (("daily", "daily_usd"), ("monthly", "monthly_usd"))
 _config_cache: dict | None = None
 _config_lock = threading.Lock()
 
+# Failure-streak state for load_config() (issue #135). A read/parse failure is
+# never memoized: _load_failure_sig holds the stat signature captured BEFORE
+# the failed read, and while the file is unchanged load_config() returns the
+# default (budgets-disabled) config for that call without re-opening it. The
+# next call retries as soon as the file's (st_ino, st_mtime_ns, st_size)
+# changes — mirroring the pricing.yaml fix in #134. Pinning a failed read used
+# to disable enforcement for the rest of the process's life.
+_load_failure_sig: tuple[int, int, int] | None = None
+_load_failure_warned: bool = False
+
+
+# The atomic-write primitive is shared with the pricing side (#134/#135): it lives
+# in ``pricing_refresh`` so there is exactly one implementation. Only the standalone
+# dashboard keeps a copy of its own — it cannot import plugin code (two-surface
+# rule) — and its parity against the shared helper is asserted behaviourally.
+
+
+def _file_signature(path: Path) -> tuple | None:
+    """Stat signature for failure-streak gating: (st_ino, st_mtime_ns, st_size).
+
+    The inode is part of the signature because every ``os.replace`` commit
+    yields a new one, even when ``mtime_ns`` and size collide with the file it
+    replaced. ``None`` when the file cannot be stat'd (missing/removed).
+    """
+    try:
+        st = path.stat()
+        return (st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
 # Short-TTL verdict cache so the pre_tool_call gate (which fires on EVERY tool
 # call) does not re-query SQLite within a single assistant turn. Spend only
 # changes when a new llm call is recorded, so a few seconds is safe.
@@ -174,8 +205,16 @@ def _pricing_path() -> Path:
 
 def load_config() -> dict:
     """Load and cache budget.yaml. Returns a normalized config dict. A missing
-    or malformed file yields an empty (disabled) budget — never raises."""
-    global _config_cache
+    or malformed file yields an empty (disabled) budget — never raises.
+
+    A malformed file is NEVER memoized (issue #135): the failure is recorded
+    as the file's stat signature captured before the read, and while the file
+    is unchanged the default config is returned for that call without
+    re-opening it. The next call retries as soon as the file changes — no
+    ``reload_config()`` or restart needed. Pinning a failed read used to
+    disable enforcement for the rest of the process's life.
+    """
+    global _config_cache, _load_failure_sig, _load_failure_warned
     with _config_lock:
         if _config_cache is not None:
             return _config_cache
@@ -185,7 +224,20 @@ def load_config() -> dict:
             "on_estimated": dict(_DEFAULT_ON_ESTIMATED),
         }
         path = _budget_path()
+        if _load_failure_sig is not None and _file_signature(path) == _load_failure_sig:
+            # Unchanged since the failed read: one stat per call, no open.
+            return cfg
+        _load_failure_sig = None
         if path.exists():
+            # Signature BEFORE the read, and OUTSIDE the try: the failure branch below
+            # records it, so it has to be bound even when the first statement inside the
+            # try raises (the `import yaml` is the obvious case). Capturing it inside the
+            # try made `_load_failure_sig = sig` raise UnboundLocalError out of
+            # load_config() — which sits on the pre_tool_call path and must never raise.
+            # A post-failure stat would be wrong anyway: a concurrent writer that
+            # atomically replaces the file mid-parse would hand us the good replacement's
+            # signature and pin the instance to the empty table forever.
+            sig = _file_signature(path)
             try:
                 import yaml
 
@@ -197,16 +249,25 @@ def load_config() -> dict:
                 if isinstance(raw.get("on_estimated"), dict):
                     cfg["on_estimated"].update(raw["on_estimated"])
             except Exception as exc:
-                logger.warning("Failed to load budget config %s: %s", path, exc)
+                if not _load_failure_warned:
+                    logger.warning("Failed to load budget config %s: %s", path, exc)
+                    _load_failure_warned = True
+                else:
+                    logger.debug("Failed to load budget config %s: %s", path, exc)
+                _load_failure_sig = sig
+                return cfg
+            _load_failure_warned = False
         _config_cache = cfg
         return cfg
 
 
 def reload_config() -> None:
     """Drop the cached config (after an edit) so the next read re-parses."""
-    global _config_cache
+    global _config_cache, _load_failure_sig, _load_failure_warned
     with _config_lock:
         _config_cache = None
+        _load_failure_sig = None
+        _load_failure_warned = False
     with _verdict_lock:
         _verdict_cache.clear()
 
@@ -698,8 +759,6 @@ def _set_budget(scope: str, window: str, usd: float, scope_id: str = "") -> str:
     ``global`` scope takes no id. Mirrors the read structure in
     ``_resolve_limits``.
     """
-    import os
-
     import yaml
 
     if scope not in ("global", "cron_job", "sender", "profile"):
@@ -734,12 +793,16 @@ def _set_budget(scope: str, window: str, usd: float, scope_id: str = "") -> str:
         else:
             node.setdefault("default", {})[key] = usd
 
-    # Atomic write: temp file + os.replace (POSIX atomic)
-    # Prevents watchdog from reading partial/empty YAML on IN_MODIFY
-    tmp = path.with_suffix(".yaml.tmp")
-    with open(tmp, "w") as f:
-        yaml.safe_dump(raw, f, default_flow_style=False, sort_keys=False)
-    os.replace(tmp, path)
+    # Atomic write via the shared primitive (unique temp + fsync + os.replace,
+    # existing mode kept, symlink target followed) — see #134/#135. Prevents a
+    # concurrent reader (watchdog, another plugin instance, out-of-process
+    # dashboard) from ever parsing a partial file. Imported lazily, like
+    # setup_wizard.py does, so the plugin package's import order cannot bite.
+    from . import pricing_refresh
+
+    pricing_refresh._atomic_write_text(
+        path, yaml.safe_dump(raw, default_flow_style=False, sort_keys=False)
+    )
     reload_config()
     target = f"{scope} '{scope_id}'" if scope_id else scope
     return f"Set {target} {window} budget to ${usd:.2f}. Saved to {path}."

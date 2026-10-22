@@ -279,10 +279,17 @@ def _build_budget_yaml(data: dict) -> str:
 
 
 def _write_budget(data: dict) -> Path:
+    # Route through the atomic writer (unique temp + fsync + os.replace, mode
+    # kept, symlink followed) — see #134/#135. A plain write_text() truncates in
+    # place, so a concurrent reader can parse an empty or partial file. The
+    # primitive is the shared one in pricing_refresh — the same one the pricing
+    # side uses; only the standalone dashboard keeps a copy of its own.
+    from . import pricing_refresh
+
     _tele_dir().mkdir(parents=True, exist_ok=True)
     content = _build_budget_yaml(data)
     p = _budget_path()
-    p.write_text(content)
+    pricing_refresh._atomic_write_text(p, content)
     return p
 
 

@@ -1108,6 +1108,34 @@ be empty, not just the absence of a `budget.yaml` file, or the fallback would
 wrongly claim nothing is configured while a stale/inactive scope still has a
 limit set.
 
+### Failed reads are never memoized — but a missing file still is
+
+`load_config()` is on the `pre_tool_call` path, so its contract is **it never
+raises**. A read or parse failure therefore cannot be allowed to disable budget
+enforcement for the rest of the process's life: instead the failure is recorded
+as the file's stat signature `(st_ino, st_mtime_ns, st_size)`, captured
+**before** the read. While the file is unchanged, the next call returns the
+default (budgets-disabled) config from one `stat` without re-opening the file;
+the first call after the file changes retries the parse for real — no
+`reload_config()` and no restart. One WARNING per failure streak, DEBUG after.
+
+Two behaviours that are easy to conflate, and differ deliberately:
+
+| state of `budget.yaml` | result | retried? |
+|---|---|---|
+| **missing** | budgets disabled | no — cached as before (documented behavior, unchanged) |
+| **present but unreadable/malformed** | budgets disabled for that call | yes — the next call re-parses once the signature changes |
+
+The signature is captured *outside* the `try`. Inside it, a failure in the very
+first statement (the `import yaml`) would reach the `except` branch with `sig`
+still unbound and raise `UnboundLocalError` out of `load_config()` — the one
+thing this function must not do.
+
+`pricing.yaml` reads were given the same treatment, capturing the signature as
+`pre_read_sig` before the read. The two now behave identically on failure and
+differ on the missing-file case (a missing `pricing.yaml` still falls through to
+the bundled defaults). See `### Atomic write (issue #105/#106)` below.
+
 ### Anti-spam ledger (`budget_alerts` table)
 
 Soft alerts fire **once per window per scope** — not on every `pre_llm_call`.
