@@ -16,6 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keep NULL** — their turn ids were never captured, and NULL is the honest
   value. No backfill, no data rewrite, no rollup table.
 
+### Added — /stats profile filter (`--profile`)
+
+- `/stats` and `hermes telemetry stats` accept a `--profile <name>` flag that
+  restricts the summary, providers, and models views to runs tagged with that
+  profile. `--profile -` selects the unattributed (NULL-profile) bucket. The
+  summary JSON output gains a `profile` field carrying the applied filter
+  (or `null` when unfiltered). `stats_summary`, `stats_by_provider`, and
+  `stats_by_model` all take the new `profile` kwarg; the `llm_calls`-based
+  queries filter via a `session_id IN (SELECT session_id FROM runs WHERE
+  profile = ?)` subquery so no join rewrites the aggregation.
+
 ### Added — Turn identity on `llm_calls` / `tool_calls` (schema v18)
 
 - `turn_id` (`{session_id}:{task_id}:{8hex}`), `task_id` and `api_request_id`

@@ -136,6 +136,12 @@ def _build_parser_into(sub) -> None:
         help="End date (ISO 8601, exclusive). Omit for no upper bound.",
     )
     sp.add_argument("--json", action="store_true", help="Output as JSON")
+    sp.add_argument(
+        "--profile",
+        dest="profile",
+        default=None,
+        help="Restrict summary/providers/models views to one profile ('-' = unattributed)",
+    )
 
     bp = sub.add_parser("budget", help="Show budget status or set limits")
     bp.add_argument("--json", action="store_true", help="Output as JSON")
@@ -248,35 +254,40 @@ def _resolve_date_range(args: argparse.Namespace) -> tuple[str | None, str | Non
 
 def _handle_stats(args: argparse.Namespace) -> None:
     date_from, date_to = _resolve_date_range(args)
+    profile: str | None = getattr(args, "profile", None)
 
     if args.json:
-        _stats_json(args.subcommand, date_from, date_to)
+        _stats_json(args.subcommand, date_from, date_to, profile)
     else:
-        _stats_text(args.subcommand, date_from, date_to)
+        _stats_text(args.subcommand, date_from, date_to, profile)
 
 
-def _stats_text(subcommand: str, date_from: str | None, date_to: str | None) -> None:
+def _stats_text(
+    subcommand: str, date_from: str | None, date_to: str | None, profile: str | None
+) -> None:
     if subcommand.startswith("cron"):
         print(stats._cron_block(date_from=date_from, date_to=date_to))
     elif subcommand.startswith("providers"):
-        print(stats._providers_block(date_from=date_from, date_to=date_to))
+        print(stats._providers_block(date_from=date_from, date_to=date_to, profile=profile))
     elif subcommand.startswith("models"):
-        print(stats._models_block(date_from=date_from, date_to=date_to))
+        print(stats._models_block(date_from=date_from, date_to=date_to, profile=profile))
     else:
         # today, week, month, last-N-days
-        print(stats._summary_block(date_from=date_from, date_to=date_to))
+        print(stats._summary_block(date_from=date_from, date_to=date_to, profile=profile))
 
 
-def _stats_json(subcommand: str, date_from: str | None, date_to: str | None) -> None:
+def _stats_json(
+    subcommand: str, date_from: str | None, date_to: str | None, profile: str | None
+) -> None:
     if subcommand.startswith("cron"):
         data = db.cost_by_job(date_from=date_from, date_to=date_to)
     elif subcommand.startswith("providers"):
-        data = db.stats_by_provider(date_from=date_from, date_to=date_to)
+        data = db.stats_by_provider(date_from=date_from, date_to=date_to, profile=profile)
     elif subcommand.startswith("models"):
-        data = db.stats_by_model(date_from=date_from, date_to=date_to)
+        data = db.stats_by_model(date_from=date_from, date_to=date_to, profile=profile)
     else:
         # today, week, month, last-N-days
-        data = db.stats_summary(date_from=date_from, date_to=date_to)
+        data = db.stats_summary(date_from=date_from, date_to=date_to, profile=profile)
     print(json.dumps(data, default=str))
 
 
