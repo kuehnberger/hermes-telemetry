@@ -71,12 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `idx_llm_profile` — the indexes a per-profile filter on those columns needs.
   Guarded on the version marker *and* on the columns, so a half-applied DB
   self-heals; idempotent.
-- **No reader yet.** Nothing in `stats.py`, `budget.py`,
-  `dashboard/plugin_api.py` or `dashboard/serve.py` consumes the new columns;
-  the per-profile filter the dashboard uses is still the `runs` correlation in
-  `plugin_api.py::_calls_profile_clause`. The columns and their indexes are
-  landed now so a per-profile query over tool/llm traffic has a column to filter
-  on; wiring that clause (and its `serve.py` duplicate) is the follow-up.
+- **Reader wired.** `dashboard/plugin_api.py::_calls_profile_clause` now prefers the
+  row's own ``profile`` column (schema v19) and falls back to the ``runs``
+  correlation for an unlabelled row — so the per-profile filter over tool/llm
+  traffic has a column to filter on after all. Same change for ``serve.py``'s
+  duplicate surface would be the natural follow-up per the two-surface rule.
 
 ### Fixed — the `api_request_error` handler read the wrong payload shape
 
