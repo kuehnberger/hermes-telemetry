@@ -536,10 +536,17 @@ def _extract_profile_flag(raw_args: str) -> tuple[str, str | None, str | None]:
 
 
 def _efficiency_block(
-    window_hours: int | None = None, *, date_from: str | None = None, date_to: str | None = None
+    window_hours: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
 ) -> str:
-    rows = db.efficiency_runs(window_hours=window_hours, date_from=date_from, date_to=date_to)
+    rows = db.efficiency_runs(
+        window_hours=window_hours, date_from=date_from, date_to=date_to, profile=profile
+    )
     label = _window_label(window_hours) if window_hours else _date_range_label(date_from, date_to)
+    label += _profile_label_suffix(profile)
     if not rows:
         return f"No completed sessions found for {label}."
 
@@ -573,12 +580,17 @@ def _efficiency_block(
 
 
 def _smells_block(
-    window_hours: int | None = None, *, date_from: str | None = None, date_to: str | None = None
+    window_hours: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
 ) -> str:
     smells = smell_detector.detect_all(
-        window_hours=window_hours, date_from=date_from, date_to=date_to
+        window_hours=window_hours, date_from=date_from, date_to=date_to, profile=profile
     )
     label = _window_label(window_hours) if window_hours else _date_range_label(date_from, date_to)
+    label += _profile_label_suffix(profile)
 
     if not smells:
         return f"No AI smells detected for {label}."
@@ -632,8 +644,8 @@ def handle(raw_args: str) -> str:
     alongside the preset subcommands so the in-chat surface has parity with the
     standalone CLI. When a date flag is supplied, the matching block ignores the
     preset window and queries the (possibly bounded) date range instead. The
-    profile flag filters summary/providers/models views to one profile
-    (``--profile -`` selects unattributed, NULL-profile runs).
+    profile flag filters summary/providers/models/efficiency/smells views to one
+    profile (``--profile -`` selects unattributed, NULL-profile runs).
     """
     remaining, date_from, date_to, err = _extract_date_flags(raw_args or "")
     if err:
@@ -708,24 +720,24 @@ def handle(raw_args: str) -> str:
     if args.startswith("efficiency"):
         sub = args[len("efficiency") :].strip()
         if has_range and sub in ("", "today", "week", "month"):
-            return _efficiency_block(date_from=date_from, date_to=date_to)
+            return _efficiency_block(date_from=date_from, date_to=date_to, profile=profile)
         if sub in ("", "today"):
-            return _efficiency_block(24)
+            return _efficiency_block(24, profile=profile)
         if sub == "week":
-            return _efficiency_block(168)
+            return _efficiency_block(168, profile=profile)
         if sub == "month":
-            return _efficiency_block(720)
+            return _efficiency_block(720, profile=profile)
 
     if args.startswith("smells"):
         sub = args[len("smells") :].strip()
         if has_range and sub in ("", "today", "week", "month"):
-            return _smells_block(date_from=date_from, date_to=date_to)
+            return _smells_block(date_from=date_from, date_to=date_to, profile=profile)
         if sub in ("", "today"):
-            return _smells_block(24)
+            return _smells_block(24, profile=profile)
         if sub == "week":
-            return _smells_block(168)
+            return _smells_block(168, profile=profile)
         if sub == "month":
-            return _smells_block(720)
+            return _smells_block(720, profile=profile)
 
     return (
         "Usage: /stats [today|week|month|cron|cron week|cron month|providers|models|efficiency|smells|raw [N]]\n"
@@ -748,7 +760,7 @@ def handle(raw_args: str) -> str:
         "  /stats models --from 2026-06-16T12:00:00Z\n"
         "  /stats providers --from 2026-06-10 --to 2026-06-15\n"
         "\n"
-        "Profile filter (summary/providers/models views):\n"
+        "Profile filter (summary/providers/models/efficiency/smells views):\n"
         "  /stats models --profile faro    — only runs tagged profile 'faro'\n"
         "  /stats --profile -              — only unattributed (NULL-profile) runs"
     )

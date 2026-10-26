@@ -16,8 +16,11 @@ Each smell carries a severity level (warning, medium, high) and a human-readable
 description that the /stats smells subcommand surfaces.
 
 Public API:
-  detect_all(window_hours, date_from, date_to) -> list[dict]
-  detect_by_session(window_hours, date_from, date_to) -> list[dict]
+  detect_all(window_hours, date_from, date_to, profile) -> list[dict]
+  detect_by_session(window_hours, date_from, date_to, profile) -> list[dict]
+
+``profile`` restricts detection to one profile's runs (``-`` selects
+unattributed, NULL-profile runs); ``None`` means no filter.
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ def _detect_context_rotation(
     *,
     date_from: str | None = None,
     date_to: str | None = None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """Sessions where input tokens vastly outnumber output tokens.
 
@@ -50,6 +54,8 @@ def _detect_context_rotation(
     """
     conn = db._get_conn()
     where_sql, params = db._build_where_clause(window_hours, date_from, date_to)
+    prof_frag, prof_params = db._profile_where(profile, "profile")
+    runs_where = f"{where_sql} AND {prof_frag}" if prof_frag else where_sql
 
     rows = conn.execute(
         f"""\
@@ -61,14 +67,14 @@ def _detect_context_rotation(
                COALESCE(status, 'running')         AS status,
                started_at
         FROM runs
-        WHERE {where_sql}
+        WHERE {runs_where}
           AND status != 'running'
           AND tokens_in > 1000
           AND CAST(tokens_out AS REAL) / CAST(tokens_in AS REAL) < 0.10
         ORDER BY tokens_in DESC
         LIMIT 50
         """,
-        params,
+        [*params, *prof_params],
     ).fetchall()
 
     return [
@@ -97,6 +103,7 @@ def _detect_loop_traps(
     *,
     date_from: str | None = None,
     date_to: str | None = None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """Sessions where a single tool dominates all tool calls.
 
@@ -106,6 +113,8 @@ def _detect_loop_traps(
     """
     conn = db._get_conn()
     tools_where, tools_params = db._build_tools_where(window_hours, date_from, date_to)
+    prof_frag, prof_params = db._profile_where(profile, "r.profile")
+    tools_where = f"{tools_where} AND {prof_frag}" if prof_frag else tools_where
 
     # Fetch all tool calls for sessions within the window, then aggregate
     # in Python (SQLite does not support referencing SELECT aliases in
@@ -123,7 +132,7 @@ def _detect_loop_traps(
           AND r.status != 'running'
         ORDER BY tc.session_id
         """,
-        tools_params,
+        [*tools_params, *prof_params],
     ).fetchall()
 
     # Aggregate per session in Python
@@ -177,6 +186,7 @@ def _detect_tool_thrashing(
     *,
     date_from: str | None = None,
     date_to: str | None = None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """Sessions with many tool calls and a high failure rate.
 
@@ -186,6 +196,8 @@ def _detect_tool_thrashing(
     """
     conn = db._get_conn()
     tools_where, tools_params = db._build_tools_where(window_hours, date_from, date_to)
+    prof_frag, prof_params = db._profile_where(profile, "r.profile")
+    tools_where = f"{tools_where} AND {prof_frag}" if prof_frag else tools_where
 
     rows = conn.execute(
         f"""\
@@ -205,7 +217,7 @@ def _detect_tool_thrashing(
         ORDER BY total_tools DESC
         LIMIT 50
         """,
-        tools_params,
+        [*tools_params, *prof_params],
     ).fetchall()
 
     return [
@@ -232,6 +244,7 @@ def _detect_high_error_rate(
     *,
     date_from: str | None = None,
     date_to: str | None = None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """Sessions that ended with an error status.
 
@@ -242,6 +255,8 @@ def _detect_high_error_rate(
     """
     conn = db._get_conn()
     where_sql, params = db._build_where_clause(window_hours, date_from, date_to)
+    prof_frag, prof_params = db._profile_where(profile, "profile")
+    runs_where = f"{where_sql} AND {prof_frag}" if prof_frag else where_sql
 
     # First get the error rate for severity scaling
     agg = conn.execute(
@@ -250,10 +265,10 @@ def _detect_high_error_rate(
             COUNT(*)                                          AS total,
             SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors
         FROM runs
-        WHERE {where_sql}
+        WHERE {runs_where}
           AND status != 'running'
         """,
-        params,
+        [*params, *prof_params],
     ).fetchone()
 
     total = agg["total"] or 0
@@ -275,12 +290,12 @@ def _detect_high_error_rate(
                ROUND(COALESCE(cost_usd, 0.0), 6) AS cost_usd,
                started_at
         FROM runs
-        WHERE {where_sql}
+        WHERE {runs_where}
           AND status = 'error'
         ORDER BY started_at DESC
         LIMIT 50
         """,
-        params,
+        [*params, *prof_params],
     ).fetchall()
 
     return [
@@ -315,6 +330,7 @@ def _detect_massive_sessions(
     *,
     date_from: str | None = None,
     date_to: str | None = None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """Sessions with extreme token counts or API call volumes.
 
@@ -324,6 +340,8 @@ def _detect_massive_sessions(
     """
     conn = db._get_conn()
     where_sql, params = db._build_where_clause(window_hours, date_from, date_to)
+    prof_frag, prof_params = db._profile_where(profile, "profile")
+    runs_where = f"{where_sql} AND {prof_frag}" if prof_frag else where_sql
 
     rows = conn.execute(
         f"""\
@@ -338,7 +356,7 @@ def _detect_massive_sessions(
                COALESCE(duration_ms, 0)            AS duration_ms,
                started_at
         FROM runs
-        WHERE {where_sql}
+        WHERE {runs_where}
           AND status != 'running'
           AND (
               (tokens_in + tokens_out) > 100000
@@ -347,7 +365,7 @@ def _detect_massive_sessions(
         ORDER BY (tokens_in + tokens_out) DESC
         LIMIT 50
         """,
-        params,
+        [*params, *prof_params],
     ).fetchall()
 
     return [
@@ -396,6 +414,7 @@ def detect_all(
     *,
     date_from: str | None = None,
     date_to: str | None = None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """Run all smell detectors and return a combined, sorted list.
 
@@ -403,13 +422,21 @@ def detect_all(
     smell type. Each entry has keys:
       smell, severity, session_id, cron_job_id, detail,
       plus smell-specific fields.
+
+    ``profile`` restricts detection to one profile's runs (``-`` selects
+    unattributed, NULL-profile runs); ``None`` means no filter.
     """
     all_smells: list[dict[str, Any]] = []
     severity_rank = {"high": 0, "medium": 1, "warning": 2}
 
     for smell_name, detector_fn in _SMELL_DETECTORS:
         try:
-            results = detector_fn(window_hours=window_hours, date_from=date_from, date_to=date_to)
+            results = detector_fn(
+                window_hours=window_hours,
+                date_from=date_from,
+                date_to=date_to,
+                profile=profile,
+            )
             all_smells.extend(results)
         except Exception as exc:
             # Smell detection is best-effort; a single broken query should not
@@ -427,6 +454,7 @@ def detect_by_session(
     *,
     date_from: str | None = None,
     date_to: str | None = None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return smells grouped by session_id for per-session views.
 
@@ -434,7 +462,9 @@ def detect_by_session(
       session_id, cron_job_id, status, started_at, smells (list of smell dicts),
       total_smells
     """
-    all_smells = detect_all(window_hours=window_hours, date_from=date_from, date_to=date_to)
+    all_smells = detect_all(
+        window_hours=window_hours, date_from=date_from, date_to=date_to, profile=profile
+    )
 
     sessions: dict[str, dict[str, Any]] = {}
     for s in all_smells:

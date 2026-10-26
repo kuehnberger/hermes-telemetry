@@ -1709,7 +1709,11 @@ def stats_by_model(
 
 
 def efficiency_runs(
-    window_hours: int | None = None, *, date_from: str | None = None, date_to: str | None = None
+    window_hours: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return per-session efficiency scores (0-100) based on token productivity.
 
@@ -1726,6 +1730,8 @@ def efficiency_runs(
     """
     conn = _get_conn()
     where_sql, params = _build_where_clause(window_hours, date_from, date_to)
+    prof_frag, prof_params = _profile_where(profile, "profile")
+    runs_where = f"{where_sql} AND {prof_frag}" if prof_frag else where_sql
 
     rows = conn.execute(
         f"""
@@ -1739,12 +1745,12 @@ def efficiency_runs(
             ROUND(COALESCE(cost_usd, 0.0), 6)  AS cost_usd,
             started_at
         FROM runs
-        WHERE {where_sql}
+        WHERE {runs_where}
           AND status != 'running'
         ORDER BY started_at DESC
         LIMIT 100
         """,
-        params,
+        [*params, *prof_params],
     ).fetchall()
 
     result = []

@@ -140,7 +140,7 @@ def _build_parser_into(sub) -> None:
         "--profile",
         dest="profile",
         default=None,
-        help="Restrict summary/providers/models views to one profile ('-' = unattributed)",
+        help="Restrict summary/providers/models/efficiency/smells views to one profile ('-' = unattributed)",
     )
 
     bp = sub.add_parser("budget", help="Show budget status or set limits")
