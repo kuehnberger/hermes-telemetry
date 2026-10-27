@@ -1119,12 +1119,18 @@ default (budgets-disabled) config from one `stat` without re-opening the file;
 the first call after the file changes retries the parse for real — no
 `reload_config()` and no restart. One WARNING per failure streak, DEBUG after.
 
-Two behaviours that are easy to conflate, and differ deliberately:
+An empty parse is ambiguous — it is exactly what a truncate-in-place writer
+(a hand edit, `> budget.yaml`, config management) leaves mid-write — so it
+rides the same streak instead of being pinned (#146). It logs nothing, since a
+comments-only file is a legitimate "no budgets" config.
+
+The behaviours that are easy to conflate, and differ deliberately:
 
 | state of `budget.yaml` | result | retried? |
 |---|---|---|
 | **missing** | budgets disabled | no — cached as before (documented behavior, unchanged) |
 | **present but unreadable/malformed** | budgets disabled for that call | yes — the next call re-parses once the signature changes |
+| **present but empty** (0-byte, or whitespace/comments only — `yaml.safe_load` returns `None`) | budgets disabled for that call | yes — same signature streak, no WARNING (#146) |
 
 The signature is captured *outside* the `try`. Inside it, a failure in the very
 first statement (the `import yaml`) would reach the `except` branch with `sig`
