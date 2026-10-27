@@ -768,9 +768,11 @@ function renderBudget(data) {
     const cls = s.level === 'hard' ? 'hard' : s.level === 'soft' ? 'soft' : 'ok';
     const label = escHtml(s.scope);
     const safeScope = s.scope.replace(/'/g, "\\'");
+    // Per-profile rows (scope_id set) are read-only: the edit modal only handles global scopes.
+    const editBtn = s.scope_id ? '' : `<button class="budget-edit-btn" onclick="openBudgetModal('${safeScope}')">${i18n_t('Edit')}</button>`;
     const windowText = fmtBudgetWindow(s.window_start_utc, s.window_end_utc, s.viewer_timezone);
     html += `<div class="budget-item">
-      <div class="info"><span>${label}</span><span>${fmtCost(s.spent)} / ${fmtCost(s.limit)} (${s.pct}%)</span><button class="budget-edit-btn" onclick="openBudgetModal('${safeScope}')">${i18n_t('Edit')}</button></div>
+      <div class="info"><span>${label}</span><span>${fmtCost(s.spent)} / ${fmtCost(s.limit)} (${s.pct}%)</span>${editBtn}</div>
       <div class="bar-bg"><div class="bar-fill ${cls}" style="width:${Math.min(s.pct, 100)}%"></div></div>
       ${windowText ? `<div class="subtle-note">${windowText}</div>` : ''}
     </div>`;

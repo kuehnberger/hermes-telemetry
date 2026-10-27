@@ -456,6 +456,80 @@ def test_budget_update_returns_viewer_timezone_metadata(serve_module, tmp_path):
     assert updated_daily["window_end_utc"] == expected_daily["window_end_utc"]
 
 
+def test_api_budget_surfaces_per_profile_budgets(serve_module, tmp_path):
+    import sqlite3
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    db_path = tmp_path / "telemetry.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE runs (started_at TEXT, cost_usd REAL, estimated_llm_calls INTEGER, "
+        "api_calls INTEGER, profile TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO runs (started_at, cost_usd, estimated_llm_calls, api_calls, profile) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (now_iso, 2.0, 0, 1, "faro"),
+    )
+    conn.execute(
+        "INSERT INTO runs (started_at, cost_usd, estimated_llm_calls, api_calls, profile) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (now_iso, 1.0, 0, 1, "nadia"),
+    )
+    conn.commit()
+    conn.close()
+
+    budget_path = tmp_path / "budget.yaml"
+    budget_path.write_text(
+        "budgets:\n"
+        "  global:\n"
+        "    daily_usd: 5.0\n"
+        "  per_profile:\n"
+        "    default:\n"
+        "      daily_usd: 10.0\n"
+        "    overrides:\n"
+        "      faro:\n"
+        "        daily_usd: 20.0\n"
+        "thresholds:\n"
+        "  soft_pct: 0.8\n"
+        "  hard_pct: 1.0\n"
+    )
+
+    serve_module.DB_PATH = db_path
+    serve_module._local.c = None
+
+    out = serve_module.api_budget("UTC")
+    by_scope = {x["scope"]: x for x in out["budgets"]}
+
+    faro = by_scope["profile:faro/daily"]
+    assert faro["scope_id"] == "faro"
+    assert faro["limit"] == 20.0  # override beats default
+    assert faro["spent"] == 2.0
+    assert faro["pct"] == 10.0
+    assert faro["level"] == "ok"
+
+    nadia = by_scope["profile:nadia/daily"]
+    assert nadia["scope_id"] == "nadia"
+    assert nadia["limit"] == 10.0  # default applies when no override
+    assert nadia["spent"] == 1.0
+
+    # Global scope still present alongside the per-profile scopes.
+    assert "global/daily" in by_scope
+
+
+def test_budget_panel_edit_button_skips_per_profile_rows():
+    """Per-profile rows are read-only in the standalone panel: the edit modal
+    (api_budget_detail / api_budget_update) only accepts ALLOWED_SCOPES, so an
+    Edit button on a "profile:<name>/<window>" row opens a modal that errors."""
+    html = (Path(__file__).parent.parent / "dashboard" / "index.html").read_text(encoding="utf-8")
+    start = html.index("function renderBudget(data)")
+    body = html[start : html.index("\nfunction ", start + 1)]
+    edit_btn = body.index("budget-edit-btn")
+    gate = body.rfind("s.scope_id", 0, edit_btn)
+    assert gate != -1, "renderBudget must gate the Edit button on s.scope_id"
+
+
 def test_budget_detail_restores_default_thresholds(serve_module, tmp_path):
     import sqlite3
 
