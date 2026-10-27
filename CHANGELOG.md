@@ -174,6 +174,16 @@ than swallowed by the previous one's suppression.
   retries as soon as the file changes — no `reload_config()` or restart
   needed. A missing `budget.yaml` still means budgets are disabled.
 
+### Fixed — an empty `budget.yaml` is no longer pinned as "budgets disabled" (#146)
+
+- **A 0-byte or comments-only `budget.yaml` still disabled enforcement until
+  reload.** #135 stopped memoizing reads that raise, but `yaml.safe_load`
+  returns `None` on an empty stream, which was cached as an empty budget
+  table. A truncate-in-place writer caught mid-write (a hand edit,
+  `> budget.yaml`, config management) therefore disabled enforcement for the
+  rest of the process's life. An empty parse now rides the same failure
+  streak: disabled for that call only, retried as soon as the file changes.
+
 ### Added — `hermes telemetry pricing recalculate` (#83)
 
 - **Historical costs stayed frozen after a pricing correction.** `pricing drift

@@ -212,7 +212,9 @@ def load_config() -> dict:
     is unchanged the default config is returned for that call without
     re-opening it. The next call retries as soon as the file changes — no
     ``reload_config()`` or restart needed. Pinning a failed read used to
-    disable enforcement for the rest of the process's life.
+    disable enforcement for the rest of the process's life. An empty parse
+    (0-byte or comments-only file, issue #146) rides the same streak, without
+    a warning.
     """
     global _config_cache, _load_failure_sig, _load_failure_warned
     with _config_lock:
