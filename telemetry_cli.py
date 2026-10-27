@@ -140,7 +140,7 @@ def _build_parser_into(sub) -> None:
         "--profile",
         dest="profile",
         default=None,
-        help="Restrict summary/providers/models/efficiency/smells views to one profile ('-' = unattributed)",
+        help="Restrict summary/providers/models/cron views to one profile ('-' = unattributed)",
     )
 
     bp = sub.add_parser("budget", help="Show budget status or set limits")
@@ -266,7 +266,7 @@ def _stats_text(
     subcommand: str, date_from: str | None, date_to: str | None, profile: str | None
 ) -> None:
     if subcommand.startswith("cron"):
-        print(stats._cron_block(date_from=date_from, date_to=date_to))
+        print(stats._cron_block(date_from=date_from, date_to=date_to, profile=profile))
     elif subcommand.startswith("providers"):
         print(stats._providers_block(date_from=date_from, date_to=date_to, profile=profile))
     elif subcommand.startswith("models"):
@@ -280,7 +280,7 @@ def _stats_json(
     subcommand: str, date_from: str | None, date_to: str | None, profile: str | None
 ) -> None:
     if subcommand.startswith("cron"):
-        data = db.cost_by_job(date_from=date_from, date_to=date_to)
+        data = db.cost_by_job(date_from=date_from, date_to=date_to, profile=profile)
     elif subcommand.startswith("providers"):
         data = db.stats_by_provider(date_from=date_from, date_to=date_to, profile=profile)
     elif subcommand.startswith("models"):

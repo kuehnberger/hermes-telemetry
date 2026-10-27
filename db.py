@@ -1292,14 +1292,22 @@ def stats_summary(
 
 
 def cost_by_job(
-    window_hours: int | None = None, *, date_from: str | None = None, date_to: str | None = None
+    window_hours: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     conn = _get_conn()
     where_sql, params = _build_where_clause(window_hours, date_from, date_to)
+    prof_frag, prof_params = _profile_where(profile, "profile")
     if where_sql:
         where_sql = f"WHERE cron_job_id IS NOT NULL AND {where_sql}"
     else:
         where_sql = "WHERE cron_job_id IS NOT NULL"
+    if prof_frag:
+        where_sql += f" AND {prof_frag}"
+    params = [*params, *prof_params]
 
     rows = conn.execute(
         f"""
@@ -1329,9 +1337,14 @@ def recent_runs(
     date_from: str | None = None,
     date_to: str | None = None,
     window_hours: int | None = None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     conn = _get_conn()
     where_sql, params = _build_where_clause(window_hours, date_from, date_to)
+    prof_frag, prof_params = _profile_where(profile, "profile")
+    if prof_frag:
+        where_sql = f"{where_sql} AND {prof_frag}" if where_sql else prof_frag
+        params = [*params, *prof_params]
 
     query = """
         SELECT session_id, platform, cron_job_id, sender_id, model, provider,
@@ -1471,24 +1484,29 @@ def spend_by_scope(scope: str, scope_id: str, since_iso: str) -> dict[str, Any]:
     }
 
 
-def unattributed_child_cost(since_iso: str) -> dict[str, Any]:
+def unattributed_child_cost(since_iso: str, profile: str | None = None) -> dict[str, Any]:
     """Query-time diagnostic (no stored state): cost of child sessions whose
     immediate parent has no runs row, so the child cannot roll up to a real
     root. Near-zero in practice because subagent_start records the edge before
     the child runs; a non-zero value signals delegation edges we failed to
     record (e.g. subagent_start handler error). Surfaced in /stats.
+
+    ``profile`` restricts to children of one profile (same semantics as
+    ``_profile_where`` on the child's ``runs`` row).
     """
     conn = _get_conn()
+    prof_frag, prof_params = _profile_where(profile, "r.profile")
+    prof_sql = f" AND {prof_frag}" if prof_frag else ""
     row = conn.execute(
-        """
+        f"""
         SELECT COALESCE(SUM(r.cost_usd), 0.0) AS unattributed_usd,
                COUNT(*)                       AS edges
         FROM subagent_edges e
         JOIN runs r ON r.session_id = e.child_session_id
         LEFT JOIN runs p ON p.session_id = e.parent_session_id
-        WHERE r.started_at >= ? AND p.session_id IS NULL
+        WHERE r.started_at >= ? AND p.session_id IS NULL{prof_sql}
         """,
-        (since_iso,),
+        (since_iso, *prof_params),
     ).fetchone()
     return {
         "unattributed_usd": float(row["unattributed_usd"] or 0.0),

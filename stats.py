@@ -186,10 +186,17 @@ def _summary_block(
 
 
 def _cron_block(
-    window_hours: int | None = None, *, date_from: str | None = None, date_to: str | None = None
+    window_hours: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
 ) -> str:
-    rows = db.cost_by_job(window_hours=window_hours, date_from=date_from, date_to=date_to)
+    rows = db.cost_by_job(
+        window_hours=window_hours, date_from=date_from, date_to=date_to, profile=profile
+    )
     label = _window_label(window_hours) if window_hours else _date_range_label(date_from, date_to)
+    label += _profile_label_suffix(profile)
     if not rows:
         return f"No cron runs in {label}."
 
@@ -217,7 +224,7 @@ def _cron_block(
         if date_from
         else (datetime.now(timezone.utc) - timedelta(hours=window_hours or 720)).isoformat()
     )
-    unattr = db.unattributed_child_cost(since_iso)
+    unattr = db.unattributed_child_cost(since_iso, profile=profile)
     if unattr["edges"]:
         lines.append("")
         lines.append(
@@ -400,13 +407,20 @@ def _models_block(
     return "\n".join(lines)
 
 
-def _raw_block(limit: int = 20, *, date_from: str | None = None, date_to: str | None = None) -> str:
-    rows = db.recent_runs(limit, date_from=date_from, date_to=date_to)
+def _raw_block(
+    limit: int = 20,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
+) -> str:
+    rows = db.recent_runs(limit, date_from=date_from, date_to=date_to, profile=profile)
+    suffix = _profile_label_suffix(profile)
     if not rows:
-        return "No runs recorded yet."
+        return f"No runs recorded yet{suffix}."
 
     lines = [
-        f"hermes-telemetry — last {limit} runs",
+        f"hermes-telemetry — last {limit} runs{suffix}",
         "=" * 80,
     ]
     for r in rows:
@@ -644,8 +658,8 @@ def handle(raw_args: str) -> str:
     alongside the preset subcommands so the in-chat surface has parity with the
     standalone CLI. When a date flag is supplied, the matching block ignores the
     preset window and queries the (possibly bounded) date range instead. The
-    profile flag filters summary/providers/models/efficiency/smells views to one
-    profile (``--profile -`` selects unattributed, NULL-profile runs).
+    profile flag filters summary/providers/models/efficiency/smells/cron/raw views
+    to one profile (``--profile -`` selects unattributed, NULL-profile runs).
     """
     remaining, date_from, date_to, err = _extract_date_flags(raw_args or "")
     if err:
@@ -675,15 +689,21 @@ def handle(raw_args: str) -> str:
         )
     if args in ("cron", "cron week"):
         return (
-            _cron_block(168) if not has_range else _cron_block(date_from=date_from, date_to=date_to)
+            _cron_block(168, profile=profile)
+            if not has_range
+            else _cron_block(date_from=date_from, date_to=date_to, profile=profile)
         )
     if args == "cron month":
         return (
-            _cron_block(720) if not has_range else _cron_block(date_from=date_from, date_to=date_to)
+            _cron_block(720, profile=profile)
+            if not has_range
+            else _cron_block(date_from=date_from, date_to=date_to, profile=profile)
         )
     if args == "cron today":
         return (
-            _cron_block(24) if not has_range else _cron_block(date_from=date_from, date_to=date_to)
+            _cron_block(24, profile=profile)
+            if not has_range
+            else _cron_block(date_from=date_from, date_to=date_to, profile=profile)
         )
     if args.startswith("raw"):
         parts = args.split()
@@ -692,8 +712,10 @@ def handle(raw_args: str) -> str:
         except ValueError:
             limit = 20
         if has_range:
-            return _raw_block(min(limit, 200), date_from=date_from, date_to=date_to)
-        return _raw_block(min(limit, 200))
+            return _raw_block(
+                min(limit, 200), date_from=date_from, date_to=date_to, profile=profile
+            )
+        return _raw_block(min(limit, 200), profile=profile)
 
     if args.startswith("providers"):
         sub = args[len("providers") :].strip()

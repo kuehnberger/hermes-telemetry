@@ -2088,6 +2088,27 @@ that but ruff `UP045` would demand `X | None` back. `str = ""` is annotated, ruf
 cross-version-safe, and falsy-when-absent (the helpers gate on `if profile:`), so it's the
 correct shape for optional query params in this file.
 
+### `/stats --profile` filter semantics
+
+`--profile <name>` (slash and standalone CLI) filters the summary, providers, models, cron,
+efficiency, smells, and raw views (CLI: the first four; it has no efficiency/smells/raw
+subcommands). The helpers live in `db.py`:
+
+- **`runs`-based queries** use `_profile_where(profile, col)` against `runs.profile`
+  (`cost_by_job`, `recent_runs`, `unattributed_child_cost`, the `smell_detector` queries).
+- **`llm_calls`-based queries** use `_profile_subquery(profile)`:
+  `session_id IN (SELECT session_id FROM runs WHERE ...)`. `llm_calls` has no profile column.
+- **`-` is the NULL-profile bucket** (`profile IS NULL`), not a literal profile name.
+- **Orphans are excluded.** An `llm_calls` row whose session has no `runs` row matches no
+  profile, `-` included.
+- Block headers carry `_profile_label_suffix` (`(profile faro)` / `(unattributed)`).
+
+Forward note: once per-row `llm_calls.profile` lands (PR #145, schema v19), `_profile_subquery`
+should move to the `COALESCE(llm_calls.profile, runs.profile)` form that
+`dashboard/plugin_api.py::_calls_profile_clause` adopts in that PR (on main today both still use the `runs` subquery), so orphan rows and mid-session profile changes
+are attributed consistently across the CLI/slash and dashboard surfaces. Keep the change in
+these two helpers; callers should not need to change.
+
 ### Command: `telemetry sync-profiles`
 
 Points every Hermes profile at one shared telemetry home so all profiles read the same
