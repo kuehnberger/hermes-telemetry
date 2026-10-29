@@ -1181,14 +1181,55 @@ def _build_tools_where(
     return (" AND ".join(where_parts), params)
 
 
+def _profile_where(profile: str | None, col: str) -> tuple[str, list]:
+    """Return (sql_fragment, params) filtering a run by its profile.
+
+    ``profile`` None means no filter. The sentinel ``"-"`` selects runs whose
+    profile is NULL (unattributed). Any other value filters ``col = value``.
+    ``col`` is the (optionally qualified) profile column reference, e.g.
+    ``"profile"`` or ``"r.profile"``.
+    """
+    if profile is None:
+        return ("", [])
+    if profile == "-":
+        return (f"{col} IS NULL", [])
+    return (f"{col} = ?", [profile])
+
+
+def _profile_subquery(profile: str | None) -> tuple[str, list]:
+    """Return (sql_fragment, params) restricting llm_calls to one profile.
+
+    llm_calls carries no profile column; it joins to runs on session_id. The
+    fragment is ``session_id IN (SELECT session_id FROM runs WHERE ...)`` so
+    the caller's SELECT needs no join and no column qualification.
+    """
+    if profile is None:
+        return ("", [])
+    if profile == "-":
+        return ("session_id IN (SELECT session_id FROM runs WHERE profile IS NULL)", [])
+    return ("session_id IN (SELECT session_id FROM runs WHERE profile = ?)", [profile])
+
+
 def stats_summary(
-    window_hours: int | None = None, *, date_from: str | None = None, date_to: str | None = None
+    window_hours: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
 ) -> dict[str, Any]:
     conn = _get_conn()
     where_sql, params = _build_where_clause(window_hours, date_from, date_to)
     where_sql_ts, params_ts = _build_where_clause_ts(window_hours, date_from, date_to)
     tools_where, tools_params = _build_tools_where(window_hours, date_from, date_to)
 
+    # Profile filter: direct on `runs.profile`; a session_id subquery on
+    # llm_calls (which has no profile column); r.profile on the tool_calls
+    # query that already joins runs.
+    prof_frag, prof_params = _profile_where(profile, "profile")
+    prof_sub, prof_sub_params = _profile_subquery(profile)
+    prof_frag_r, prof_params_r = _profile_where(profile, "r.profile")
+
+    runs_where = f"{where_sql} AND {prof_frag}" if prof_frag else where_sql
     runs_row = conn.execute(
         f"""
         SELECT
@@ -1204,22 +1245,24 @@ def stats_summary(
             SUM(estimated_llm_calls)                          AS estimated_llm_calls,
             SUM(moa_calls)                                    AS moa_calls
         FROM runs
-        WHERE {where_sql}
+        WHERE {runs_where}
         """,
-        params,
+        [*params, *prof_params],
     ).fetchone()
 
+    llm_where = f"{where_sql_ts} AND {prof_sub}" if prof_sub else where_sql_ts
     llm_row = conn.execute(
         f"""
         SELECT
             COUNT(*)        AS api_calls,
             AVG(latency_ms) AS avg_latency_ms
         FROM llm_calls
-        WHERE {where_sql_ts}
+        WHERE {llm_where}
         """,
-        params_ts,
+        [*params_ts, *prof_sub_params],
     ).fetchone()
 
+    tools_where_full = f"{tools_where} AND {prof_frag_r}" if prof_frag_r else tools_where
     top_tools = conn.execute(
         f"""
         SELECT tool_name,
@@ -1228,12 +1271,12 @@ def stats_summary(
                AVG(latency_ms) AS avg_ms
         FROM tool_calls tc
         JOIN runs r ON tc.session_id = r.session_id
-        WHERE {tools_where}
+        WHERE {tools_where_full}
         GROUP BY tool_name
         ORDER BY calls DESC
         LIMIT 10
         """,
-        tools_params,
+        [*tools_params, *prof_params_r],
     ).fetchall()
 
     result = dict(runs_row)
@@ -1242,20 +1285,29 @@ def stats_summary(
     result["window_hours"] = window_hours
     result["date_from"] = date_from
     result["date_to"] = date_to
+    result["profile"] = profile
     # Parent-child attribution is not yet populated (see ONBOARDING.md)
     result["parent_links_available"] = False
     return result
 
 
 def cost_by_job(
-    window_hours: int | None = None, *, date_from: str | None = None, date_to: str | None = None
+    window_hours: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     conn = _get_conn()
     where_sql, params = _build_where_clause(window_hours, date_from, date_to)
+    prof_frag, prof_params = _profile_where(profile, "profile")
     if where_sql:
         where_sql = f"WHERE cron_job_id IS NOT NULL AND {where_sql}"
     else:
         where_sql = "WHERE cron_job_id IS NOT NULL"
+    if prof_frag:
+        where_sql += f" AND {prof_frag}"
+    params = [*params, *prof_params]
 
     rows = conn.execute(
         f"""
@@ -1285,9 +1337,14 @@ def recent_runs(
     date_from: str | None = None,
     date_to: str | None = None,
     window_hours: int | None = None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     conn = _get_conn()
     where_sql, params = _build_where_clause(window_hours, date_from, date_to)
+    prof_frag, prof_params = _profile_where(profile, "profile")
+    if prof_frag:
+        where_sql = f"{where_sql} AND {prof_frag}" if where_sql else prof_frag
+        params = [*params, *prof_params]
 
     query = """
         SELECT session_id, platform, cron_job_id, sender_id, model, provider,
@@ -1427,24 +1484,29 @@ def spend_by_scope(scope: str, scope_id: str, since_iso: str) -> dict[str, Any]:
     }
 
 
-def unattributed_child_cost(since_iso: str) -> dict[str, Any]:
+def unattributed_child_cost(since_iso: str, profile: str | None = None) -> dict[str, Any]:
     """Query-time diagnostic (no stored state): cost of child sessions whose
     immediate parent has no runs row, so the child cannot roll up to a real
     root. Near-zero in practice because subagent_start records the edge before
     the child runs; a non-zero value signals delegation edges we failed to
     record (e.g. subagent_start handler error). Surfaced in /stats.
+
+    ``profile`` restricts to children of one profile (same semantics as
+    ``_profile_where`` on the child's ``runs`` row).
     """
     conn = _get_conn()
+    prof_frag, prof_params = _profile_where(profile, "r.profile")
+    prof_sql = f" AND {prof_frag}" if prof_frag else ""
     row = conn.execute(
-        """
+        f"""
         SELECT COALESCE(SUM(r.cost_usd), 0.0) AS unattributed_usd,
                COUNT(*)                       AS edges
         FROM subagent_edges e
         JOIN runs r ON r.session_id = e.child_session_id
         LEFT JOIN runs p ON p.session_id = e.parent_session_id
-        WHERE r.started_at >= ? AND p.session_id IS NULL
+        WHERE r.started_at >= ? AND p.session_id IS NULL{prof_sql}
         """,
-        (since_iso,),
+        (since_iso, *prof_params),
     ).fetchone()
     return {
         "unattributed_usd": float(row["unattributed_usd"] or 0.0),
@@ -1552,16 +1614,25 @@ def refresh_run_cost(session_id: str) -> float:
 
 
 def stats_by_provider(
-    window_hours: int | None = None, *, date_from: str | None = None, date_to: str | None = None
+    window_hours: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """Per-provider breakdown for /stats providers.
 
     Returns one row per provider seen in llm_calls within the window:
       provider, total_calls, real_calls, estimated_calls, estimated_pct,
       provider_assumed_calls, provider_assumed_pct, cost_usd
+
+    ``profile`` restricts the result to llm_calls whose run is tagged with that
+    profile (``"-"`` selects runs with a NULL profile).
     """
     conn = _get_conn()
     where_sql, params = _build_where_clause_ts(window_hours, date_from, date_to)
+    prof_sub, prof_sub_params = _profile_subquery(profile)
+    where = f"{where_sql} AND {prof_sub}" if prof_sub else where_sql
 
     rows = conn.execute(
         f"""
@@ -1578,11 +1649,11 @@ def stats_by_provider(
             COALESCE(SUM(cache_write_tokens), 0)               AS cache_write_tokens,
             COALESCE(SUM(reasoning_tokens), 0)                 AS reasoning_tokens
         FROM llm_calls
-        WHERE {where_sql}
+        WHERE {where}
         GROUP BY COALESCE(provider, '(unknown)')
         ORDER BY cost_usd DESC
         """,
-        params,
+        [*params, *prof_sub_params],
     ).fetchall()
     result = []
     for r in rows:
@@ -1597,7 +1668,11 @@ def stats_by_provider(
 
 
 def stats_by_model(
-    window_hours: int | None = None, *, date_from: str | None = None, date_to: str | None = None
+    window_hours: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """Per-model breakdown within each provider, for /stats models.
 
@@ -1605,12 +1680,17 @@ def stats_by_model(
       provider, model, total_calls, real_calls, estimated_calls, estimated_pct,
       provider_assumed_calls, provider_assumed_pct, cost_usd
 
+    ``profile`` restricts the result to llm_calls whose run is tagged with that
+    profile (``"-"`` selects runs with a NULL profile).
+
     Ordered by provider (asc) then call count (desc) so each provider's busiest
     models surface first — this is the view that exposes dated models costing
     $0.00 separately, without dropping to raw SQL.
     """
     conn = _get_conn()
     where_sql, params = _build_where_clause_ts(window_hours, date_from, date_to)
+    prof_sub, prof_sub_params = _profile_subquery(profile)
+    where = f"{where_sql} AND {prof_sub}" if prof_sub else where_sql
 
     rows = conn.execute(
         f"""
@@ -1628,11 +1708,11 @@ def stats_by_model(
             COALESCE(SUM(cache_write_tokens), 0)              AS cache_write_tokens,
             COALESCE(SUM(reasoning_tokens), 0)                AS reasoning_tokens
         FROM llm_calls
-        WHERE {where_sql}
+        WHERE {where}
         GROUP BY COALESCE(provider, '(unknown)'), COALESCE(model, '(unknown)')
         ORDER BY provider ASC, total_calls DESC
         """,
-        params,
+        [*params, *prof_sub_params],
     ).fetchall()
     result = []
     for r in rows:
@@ -1647,7 +1727,11 @@ def stats_by_model(
 
 
 def efficiency_runs(
-    window_hours: int | None = None, *, date_from: str | None = None, date_to: str | None = None
+    window_hours: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return per-session efficiency scores (0-100) based on token productivity.
 
@@ -1664,6 +1748,8 @@ def efficiency_runs(
     """
     conn = _get_conn()
     where_sql, params = _build_where_clause(window_hours, date_from, date_to)
+    prof_frag, prof_params = _profile_where(profile, "profile")
+    runs_where = f"{where_sql} AND {prof_frag}" if prof_frag else where_sql
 
     rows = conn.execute(
         f"""
@@ -1677,12 +1763,12 @@ def efficiency_runs(
             ROUND(COALESCE(cost_usd, 0.0), 6)  AS cost_usd,
             started_at
         FROM runs
-        WHERE {where_sql}
+        WHERE {runs_where}
           AND status != 'running'
         ORDER BY started_at DESC
         LIMIT 100
         """,
-        params,
+        [*params, *prof_params],
     ).fetchall()
 
     result = []

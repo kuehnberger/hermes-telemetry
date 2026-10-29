@@ -31,6 +31,18 @@ hermes-telemetry adds three slash commands to Hermes chat: `/stats`, `/budget`, 
 
 `providers`, `models`, `efficiency`, and `smells` also accept `today` and `month`.
 
+### Profile filter
+
+Add `--profile <name>` to restrict a view to runs tagged with one Hermes profile. `--profile -` selects the unattributed bucket: runs with no profile recorded. It works on the summary, `cron`, `providers`, `models`, `efficiency`, `smells`, and `raw` views and combines with `--from` and `--to`. The block header names the applied filter.
+
+```text
+/stats models --profile faro
+/stats cron --profile faro --from 2026-06-10
+/stats --profile -
+```
+
+LLM calls that have no matching run row are not attributed to any profile, so every profile filter excludes them, `--profile -` included.
+
 ### Date ranges
 
 Any `/stats` subcommand accepts `--from` and `--to` to replace the preset window with an arbitrary range. This is useful for isolating data from after a deploy or a pricing fix without waiting for a rolling window to age out.

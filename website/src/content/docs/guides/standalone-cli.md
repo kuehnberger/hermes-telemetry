@@ -53,6 +53,18 @@ hermes-telemetry budget set profile monthly 50 --id faro
 
 `budget set <scope> <window> <usd>` takes the optional override id as `--id`. See [Budgets](/hermes-telemetry/guides/budgets/) for what the limits do.
 
+## Profile filter
+
+`stats` accepts `--profile <name>` on the summary, `cron`, `providers`, and `models` subcommands (`efficiency`, `smells`, and `raw` exist only in-chat). `--profile -` selects the unattributed bucket: runs with no profile recorded. It combines with `--from`, `--to`, and `--json`. In JSON output the summary object carries a `profile` field with the applied filter.
+
+```bash
+hermes-telemetry stats models --profile faro
+hermes-telemetry stats cron --profile faro --from 2026-06-10
+hermes-telemetry stats --profile -
+```
+
+LLM calls that have no matching run row are not attributed to any profile, so every profile filter excludes them, `--profile -` included.
+
 ## Date range filters
 
 Every `stats` subcommand accepts `--from` and `--to`. Values are ISO-8601 dates or timestamps, or the literal `now`. `--from` is inclusive and `--to` is exclusive. A date without a time means 00:00:00 UTC of that day.

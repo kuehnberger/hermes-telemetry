@@ -85,6 +85,14 @@ def _date_range_label(date_from: str | None, date_to: str | None) -> str:
     return "all time"
 
 
+def _profile_label_suffix(profile: str | None) -> str:
+    """Return a short parenthetical describing the applied profile filter."""
+    if profile is None:
+        return ""
+    name = "unattributed" if profile == "-" else f"profile {profile}"
+    return f" ({name})"
+
+
 def _date_range_to_hours(date_from: str | None, date_to: str | None) -> int | None:
     """Convert date range to approximate hours for backward compat label."""
     if not date_from:
@@ -103,9 +111,15 @@ def _date_range_to_hours(date_from: str | None, date_to: str | None) -> int | No
 
 
 def _summary_block(
-    window_hours: int | None = None, *, date_from: str | None = None, date_to: str | None = None
+    window_hours: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
 ) -> str:
-    s = db.stats_summary(window_hours=window_hours, date_from=date_from, date_to=date_to)
+    s = db.stats_summary(
+        window_hours=window_hours, date_from=date_from, date_to=date_to, profile=profile
+    )
     total = s.get("total_runs") or 0
     ok = s.get("ok_runs") or 0
     failed = s.get("failed_runs") or 0
@@ -121,6 +135,7 @@ def _summary_block(
     cost_str = f"~{_fmt_cost(cost_val)}" if has_estimated else _fmt_cost(cost_val)
 
     label = _window_label(window_hours) if window_hours else _date_range_label(date_from, date_to)
+    label += _profile_label_suffix(profile)
 
     lines = [
         f"hermes-telemetry — {label}",
@@ -171,10 +186,17 @@ def _summary_block(
 
 
 def _cron_block(
-    window_hours: int | None = None, *, date_from: str | None = None, date_to: str | None = None
+    window_hours: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
 ) -> str:
-    rows = db.cost_by_job(window_hours=window_hours, date_from=date_from, date_to=date_to)
+    rows = db.cost_by_job(
+        window_hours=window_hours, date_from=date_from, date_to=date_to, profile=profile
+    )
     label = _window_label(window_hours) if window_hours else _date_range_label(date_from, date_to)
+    label += _profile_label_suffix(profile)
     if not rows:
         return f"No cron runs in {label}."
 
@@ -202,7 +224,7 @@ def _cron_block(
         if date_from
         else (datetime.now(timezone.utc) - timedelta(hours=window_hours or 720)).isoformat()
     )
-    unattr = db.unattributed_child_cost(since_iso)
+    unattr = db.unattributed_child_cost(since_iso, profile=profile)
     if unattr["edges"]:
         lines.append("")
         lines.append(
@@ -215,10 +237,17 @@ def _cron_block(
 
 
 def _providers_block(
-    window_hours: int | None = None, *, date_from: str | None = None, date_to: str | None = None
+    window_hours: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
 ) -> str:
-    rows = db.stats_by_provider(window_hours=window_hours, date_from=date_from, date_to=date_to)
+    rows = db.stats_by_provider(
+        window_hours=window_hours, date_from=date_from, date_to=date_to, profile=profile
+    )
     label = _window_label(window_hours) if window_hours else _date_range_label(date_from, date_to)
+    label += _profile_label_suffix(profile)
     if not rows:
         return f"No API calls recorded in {label}."
 
@@ -295,10 +324,17 @@ def _providers_block(
 
 
 def _models_block(
-    window_hours: int | None = None, *, date_from: str | None = None, date_to: str | None = None
+    window_hours: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
 ) -> str:
-    rows = db.stats_by_model(window_hours=window_hours, date_from=date_from, date_to=date_to)
+    rows = db.stats_by_model(
+        window_hours=window_hours, date_from=date_from, date_to=date_to, profile=profile
+    )
     label = _window_label(window_hours) if window_hours else _date_range_label(date_from, date_to)
+    label += _profile_label_suffix(profile)
     if not rows:
         return f"No API calls recorded in {label}."
 
@@ -371,13 +407,20 @@ def _models_block(
     return "\n".join(lines)
 
 
-def _raw_block(limit: int = 20, *, date_from: str | None = None, date_to: str | None = None) -> str:
-    rows = db.recent_runs(limit, date_from=date_from, date_to=date_to)
+def _raw_block(
+    limit: int = 20,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
+) -> str:
+    rows = db.recent_runs(limit, date_from=date_from, date_to=date_to, profile=profile)
+    suffix = _profile_label_suffix(profile)
     if not rows:
-        return "No runs recorded yet."
+        return f"No runs recorded yet{suffix}."
 
     lines = [
-        f"hermes-telemetry — last {limit} runs",
+        f"hermes-telemetry — last {limit} runs{suffix}",
         "=" * 80,
     ]
     for r in rows:
@@ -477,11 +520,47 @@ def _extract_date_flags(raw_args: str) -> tuple[str, str | None, str | None, str
     return (" ".join(out), date_from, date_to, None)
 
 
+def _extract_profile_flag(raw_args: str) -> tuple[str, str | None, str | None]:
+    """Pull `--profile <name>` out of a slash-command arg string.
+
+    Returns ``(remaining, profile, error)`` where:
+      - ``remaining`` is the arg string with the flag removed.
+      - ``profile`` is the profile name, the sentinel ``"-"`` for unattributed
+        (NULL-profile) runs, or ``None`` when the flag is absent.
+      - ``error`` is a human-readable message when the flag is missing its
+        value, otherwise ``None``.
+    """
+    if not raw_args:
+        return ("", None, None)
+    tokens = raw_args.split()
+    out: list[str] = []
+    profile: str | None = None
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--profile":
+            if i + 1 >= len(tokens):
+                return ("", None, "Missing value for --profile.")
+            profile = tokens[i + 1]
+            i += 2
+        else:
+            out.append(tok)
+            i += 1
+    return (" ".join(out), profile, None)
+
+
 def _efficiency_block(
-    window_hours: int | None = None, *, date_from: str | None = None, date_to: str | None = None
+    window_hours: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
 ) -> str:
-    rows = db.efficiency_runs(window_hours=window_hours, date_from=date_from, date_to=date_to)
+    rows = db.efficiency_runs(
+        window_hours=window_hours, date_from=date_from, date_to=date_to, profile=profile
+    )
     label = _window_label(window_hours) if window_hours else _date_range_label(date_from, date_to)
+    label += _profile_label_suffix(profile)
     if not rows:
         return f"No completed sessions found for {label}."
 
@@ -515,12 +594,17 @@ def _efficiency_block(
 
 
 def _smells_block(
-    window_hours: int | None = None, *, date_from: str | None = None, date_to: str | None = None
+    window_hours: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    profile: str | None = None,
 ) -> str:
     smells = smell_detector.detect_all(
-        window_hours=window_hours, date_from=date_from, date_to=date_to
+        window_hours=window_hours, date_from=date_from, date_to=date_to, profile=profile
     )
     label = _window_label(window_hours) if window_hours else _date_range_label(date_from, date_to)
+    label += _profile_label_suffix(profile)
 
     if not smells:
         return f"No AI smells detected for {label}."
@@ -570,12 +654,17 @@ def _smells_block(
 def handle(raw_args: str) -> str:
     """Entry point for /stats command handler (Slack slash command format).
 
-    Supports ``--from <iso>`` / ``--to <iso>`` flags alongside the preset
-    subcommands so the in-chat surface has parity with the standalone CLI.
-    When a date flag is supplied, the matching block ignores the preset window
-    and queries the (possibly bounded) date range instead.
+    Supports ``--from <iso>`` / ``--to <iso>`` / ``--profile <name>`` flags
+    alongside the preset subcommands so the in-chat surface has parity with the
+    standalone CLI. When a date flag is supplied, the matching block ignores the
+    preset window and queries the (possibly bounded) date range instead. The
+    profile flag filters summary/providers/models/efficiency/smells/cron/raw views
+    to one profile (``--profile -`` selects unattributed, NULL-profile runs).
     """
     remaining, date_from, date_to, err = _extract_date_flags(raw_args or "")
+    if err:
+        return err
+    remaining, profile, err = _extract_profile_flag(remaining)
     if err:
         return err
     has_range = date_from is not None or date_to is not None
@@ -584,31 +673,37 @@ def handle(raw_args: str) -> str:
 
     if not args or args in ("today",):
         if has_range:
-            return _summary_block(date_from=date_from, date_to=date_to)
-        return _summary_block(24)
+            return _summary_block(date_from=date_from, date_to=date_to, profile=profile)
+        return _summary_block(24, profile=profile)
     if args == "week":
         return (
-            _summary_block(168)
+            _summary_block(168, profile=profile)
             if not has_range
-            else _summary_block(date_from=date_from, date_to=date_to)
+            else _summary_block(date_from=date_from, date_to=date_to, profile=profile)
         )
     if args == "month":
         return (
-            _summary_block(720)
+            _summary_block(720, profile=profile)
             if not has_range
-            else _summary_block(date_from=date_from, date_to=date_to)
+            else _summary_block(date_from=date_from, date_to=date_to, profile=profile)
         )
     if args in ("cron", "cron week"):
         return (
-            _cron_block(168) if not has_range else _cron_block(date_from=date_from, date_to=date_to)
+            _cron_block(168, profile=profile)
+            if not has_range
+            else _cron_block(date_from=date_from, date_to=date_to, profile=profile)
         )
     if args == "cron month":
         return (
-            _cron_block(720) if not has_range else _cron_block(date_from=date_from, date_to=date_to)
+            _cron_block(720, profile=profile)
+            if not has_range
+            else _cron_block(date_from=date_from, date_to=date_to, profile=profile)
         )
     if args == "cron today":
         return (
-            _cron_block(24) if not has_range else _cron_block(date_from=date_from, date_to=date_to)
+            _cron_block(24, profile=profile)
+            if not has_range
+            else _cron_block(date_from=date_from, date_to=date_to, profile=profile)
         )
     if args.startswith("raw"):
         parts = args.split()
@@ -617,56 +712,58 @@ def handle(raw_args: str) -> str:
         except ValueError:
             limit = 20
         if has_range:
-            return _raw_block(min(limit, 200), date_from=date_from, date_to=date_to)
-        return _raw_block(min(limit, 200))
+            return _raw_block(
+                min(limit, 200), date_from=date_from, date_to=date_to, profile=profile
+            )
+        return _raw_block(min(limit, 200), profile=profile)
 
     if args.startswith("providers"):
         sub = args[len("providers") :].strip()
         if has_range and sub in ("", "today", "week", "month"):
-            return _providers_block(date_from=date_from, date_to=date_to)
+            return _providers_block(date_from=date_from, date_to=date_to, profile=profile)
         if sub in ("", "today"):
-            return _providers_block(24)
+            return _providers_block(24, profile=profile)
         if sub == "week":
-            return _providers_block(168)
+            return _providers_block(168, profile=profile)
         if sub == "month":
-            return _providers_block(720)
+            return _providers_block(720, profile=profile)
 
     if args.startswith("models"):
         sub = args[len("models") :].strip()
         if has_range and sub in ("", "today", "week", "month"):
-            return _models_block(date_from=date_from, date_to=date_to)
+            return _models_block(date_from=date_from, date_to=date_to, profile=profile)
         if sub in ("", "today"):
-            return _models_block(24)
+            return _models_block(24, profile=profile)
         if sub == "week":
-            return _models_block(168)
+            return _models_block(168, profile=profile)
         if sub == "month":
-            return _models_block(720)
+            return _models_block(720, profile=profile)
 
     if args.startswith("efficiency"):
         sub = args[len("efficiency") :].strip()
         if has_range and sub in ("", "today", "week", "month"):
-            return _efficiency_block(date_from=date_from, date_to=date_to)
+            return _efficiency_block(date_from=date_from, date_to=date_to, profile=profile)
         if sub in ("", "today"):
-            return _efficiency_block(24)
+            return _efficiency_block(24, profile=profile)
         if sub == "week":
-            return _efficiency_block(168)
+            return _efficiency_block(168, profile=profile)
         if sub == "month":
-            return _efficiency_block(720)
+            return _efficiency_block(720, profile=profile)
 
     if args.startswith("smells"):
         sub = args[len("smells") :].strip()
         if has_range and sub in ("", "today", "week", "month"):
-            return _smells_block(date_from=date_from, date_to=date_to)
+            return _smells_block(date_from=date_from, date_to=date_to, profile=profile)
         if sub in ("", "today"):
-            return _smells_block(24)
+            return _smells_block(24, profile=profile)
         if sub == "week":
-            return _smells_block(168)
+            return _smells_block(168, profile=profile)
         if sub == "month":
-            return _smells_block(720)
+            return _smells_block(720, profile=profile)
 
     return (
         "Usage: /stats [today|week|month|cron|cron week|cron month|providers|models|efficiency|smells|raw [N]]\n"
-        "             [--from YYYY-MM-DD[THH:MM:SS[Z]]] [--to YYYY-MM-DD[THH:MM:SS[Z]]]\n"
+        "             [--from YYYY-MM-DD[THH:MM:SS[Z]]] [--to YYYY-MM-DD[THH:MM:SS[Z]]] [--profile <name>|-]\n"
         "  /stats               — last 24h summary\n"
         "  /stats week          — last 7 days summary\n"
         "  /stats month         — last 30 days summary\n"
@@ -683,5 +780,9 @@ def handle(raw_args: str) -> str:
         "\n"
         "Date range examples (work the same way under the CLI):\n"
         "  /stats models --from 2026-06-16T12:00:00Z\n"
-        "  /stats providers --from 2026-06-10 --to 2026-06-15"
+        "  /stats providers --from 2026-06-10 --to 2026-06-15\n"
+        "\n"
+        "Profile filter (summary/providers/models/efficiency/smells views):\n"
+        "  /stats models --profile faro    — only runs tagged profile 'faro'\n"
+        "  /stats --profile -              — only unattributed (NULL-profile) runs"
     )
