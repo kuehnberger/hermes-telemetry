@@ -38,6 +38,16 @@ from . import db, paths
 
 logger = logging.getLogger(__name__)
 
+# fcntl provides cross-process advisory locking on POSIX. On platforms without
+# fcntl (Windows) the lock degrades to a no-op in _budget_file_lock() below —
+# correctness there relies on the single-writer assumption (the standalone
+# dashboard binds loopback only). Used to serialize every writer of budget.yaml
+# and prevent lost updates (#147).
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    _fcntl = None
+
 # ---------------------------------------------------------------------------
 # File watcher for budget.yaml (hot-reload on config changes)
 # ---------------------------------------------------------------------------
@@ -170,6 +180,48 @@ def _budget_path() -> Path:
 
 def _pricing_path() -> Path:
     return paths.get_pricing_path()
+
+
+# ---------------------------------------------------------------------------
+# Cross-process lock guarding read-mutate-write of budget.yaml
+# ---------------------------------------------------------------------------
+def _budget_lock_path() -> Path:
+    """Lock file sibling to budget.yaml (``budget.yaml.lock``).
+
+    Shared on-disk lock taken by every writer of budget.yaml — the CLI
+    ``/budget set`` path (``_set_budget``) and the dashboard POST handler
+    (``dashboard/serve.py::api_budget_update``). Because the lock is a single
+    file, only one writer runs the read-mutate-write critical section at a
+    time, regardless of process or module. This prevents the lost-update race
+    where two writers both read the current YAML, each add their own key, and
+    the second ``os.replace`` silently clobbers the first (#147).
+    """
+    return _budget_path().with_name("budget.yaml.lock")
+
+
+@contextlib.contextmanager
+def _budget_file_lock():
+    """Advisory ``fcntl.flock(LOCK_EX)`` around the budget.yaml read-mutate-write.
+
+    Holds the lock for the full critical section (read current YAML, mutate the
+    dict, write to a temp file, ``os.replace``) so concurrent writers cannot
+    interleave. Releases on exit even if the section raises.
+
+    On platforms without fcntl (Windows) this is a no-op; correctness there
+    relies on the single-writer assumption.
+    """
+    lock_path = _budget_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if _fcntl is None:  # pragma: no cover - Windows
+        yield
+        return
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        _fcntl.flock(fd, _fcntl.LOCK_EX)
+        yield
+    finally:
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def load_config() -> dict:
@@ -710,37 +762,41 @@ def _set_budget(scope: str, window: str, usd: float, scope_id: str = "") -> str:
         return "The global scope takes no id. Use: set global <daily|monthly> <usd>"
     key = f"{window}_usd"
 
-    path = _budget_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    raw: dict = {}
-    if path.exists():
-        try:
-            with open(path) as f:
-                raw = yaml.safe_load(f) or {}
-        except Exception:
-            raw = {}
-    budgets = raw.setdefault("budgets", {})
-    if scope == "global":
-        budgets.setdefault("global", {})[key] = usd
-    else:
-        per_key = {
-            "cron_job": "per_cron_job",
-            "sender": "per_sender",
-            "profile": "per_profile",
-        }[scope]
-        node = budgets.setdefault(per_key, {})
-        if scope_id:
-            node.setdefault("overrides", {}).setdefault(scope_id, {})[key] = usd
+    # The full read-mutate-write (and hot-reload) is guarded by a single
+    # cross-process fcntl.flock so a concurrent dashboard POST cannot interleave
+    # a read between this writer's read and os.replace and lose an update (#147).
+    with _budget_file_lock():
+        path = _budget_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw: dict = {}
+        if path.exists():
+            try:
+                with open(path) as f:
+                    raw = yaml.safe_load(f) or {}
+            except Exception:
+                raw = {}
+        budgets = raw.setdefault("budgets", {})
+        if scope == "global":
+            budgets.setdefault("global", {})[key] = usd
         else:
-            node.setdefault("default", {})[key] = usd
+            per_key = {
+                "cron_job": "per_cron_job",
+                "sender": "per_sender",
+                "profile": "per_profile",
+            }[scope]
+            node = budgets.setdefault(per_key, {})
+            if scope_id:
+                node.setdefault("overrides", {}).setdefault(scope_id, {})[key] = usd
+            else:
+                node.setdefault("default", {})[key] = usd
 
-    # Atomic write: temp file + os.replace (POSIX atomic)
-    # Prevents watchdog from reading partial/empty YAML on IN_MODIFY
-    tmp = path.with_suffix(".yaml.tmp")
-    with open(tmp, "w") as f:
-        yaml.safe_dump(raw, f, default_flow_style=False, sort_keys=False)
-    os.replace(tmp, path)
-    reload_config()
+        # Atomic write: temp file + os.replace (POSIX atomic)
+        # Prevents watchdog from reading partial/empty YAML on IN_MODIFY.
+        tmp = path.with_suffix(".yaml.tmp")
+        with open(tmp, "w") as f:
+            yaml.safe_dump(raw, f, default_flow_style=False, sort_keys=False)
+        os.replace(tmp, path)
+        reload_config()
     target = f"{scope} '{scope_id}'" if scope_id else scope
     return f"Set {target} {window} budget to ${usd:.2f}. Saved to {path}."
 

@@ -455,6 +455,82 @@ def test_budget_update_returns_viewer_timezone_metadata(serve_module, tmp_path):
     assert updated_daily["window_end_utc"] == expected_daily["window_end_utc"]
 
 
+def test_api_budget_update_concurrent_no_lost_updates(serve_module, tmp_path):
+    """#147 — concurrent POST-style api_budget_update calls must all survive.
+
+    The dashboard POST API writes flat ``cfg["budgets"][<scope>][<window>_usd>]``
+    (no scope_id/overrides — see ALLOWED_SCOPES), so we drive the 6 distinct
+    (scope, window) keys with 24 threads (4 writers per key). Without the shared
+    budget.yaml.lock, a writer that read the YAML before a peer's atomic replace
+    clobbers that peer's key on its own replace — only a subset survives. With the
+    lock wrapping the full read-mutate-write, all 6 keys land.
+    """
+    import sqlite3
+    import threading
+
+    import yaml as _yaml
+
+    # api_budget_update ends by calling api_budget(), which reads `runs` — give
+    # the per-thread sqlite connections something valid to read against.
+    db_path = tmp_path / "telemetry.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE runs (started_at TEXT, cost_usd REAL, estimated_llm_calls INTEGER, api_calls INTEGER)"
+    )
+    # one row so window-bounded SUM(cost_usd) is non-trivially exercised
+    conn.execute(
+        "INSERT INTO runs (started_at, cost_usd, estimated_llm_calls, api_calls) VALUES (?, ?, ?, ?)",
+        ("2026-06-13T01:00:00+00:00", 0.5, 0, 1),
+    )
+    conn.commit()
+    conn.close()
+    serve_module.DB_PATH = db_path
+    serve_module._local.c = None
+
+    budget_path = serve_module.DB_PATH.parent / "budget.yaml"
+    budget_path.parent.mkdir(parents=True, exist_ok=True)
+    budget_path.write_text("budgets: {}\n")
+
+    scopes = sorted(serve_module.ALLOWED_SCOPES)  # global, per_cron_job, per_sender
+    windows = sorted(serve_module.ALLOWED_WINDOWS)  # daily, monthly
+    keys = [(s, w) for s in scopes for w in windows]  # 6 distinct keys
+    n = len(keys) * 4  # 24 writers, 4 per key
+
+    results: dict[int, object] = {}
+
+    def poster(i: int) -> None:
+        scope, window = keys[i % len(keys)]
+        try:
+            serve_module.api_budget_update(
+                {"scope": scope, "window": window, "limit_usd": float(i)}
+            )
+            results[i] = None
+        except Exception as exc:  # noqa: BLE001
+            results[i] = exc
+
+    threads = [threading.Thread(target=poster, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    failures = [i for i, r in results.items() if r is not None]
+    assert not failures, f"writer exceptions: {failures}"
+    cfg = _yaml.safe_load(budget_path.read_text())
+    budgets = cfg["budgets"]
+    surviving = {
+        (scope, win)
+        for scope in scopes
+        for win in windows
+        if (budgets.get(scope) or {}).get(f"{win}_usd") is not None
+    }
+    assert len(surviving) == len(keys), (
+        f"lost updates: only {len(surviving)}/{len(keys)} scope-window keys survived"
+    )
+    for scope, win in surviving:
+        assert isinstance(budgets[scope][f"{win}_usd"], (int, float))
+
+
 def test_budget_detail_restores_default_thresholds(serve_module, tmp_path):
     import sqlite3
 

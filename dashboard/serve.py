@@ -23,6 +23,7 @@ unreachable from other hosts. To view it from another machine, either:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -35,6 +36,18 @@ from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+# fcntl gives cross-process advisory locking on POSIX. The dashboard must NOT
+# import hermes_telemetry.budget (zero shared code by design — see
+# tests/test_dashboard_plugin_isolation), so it defines its own lock helper
+# here. Both surfaces lock on the SAME on-disk file (budget.yaml.lock) because
+# they resolve budget.yaml to the same <telemetry_home>, so a CLI /budget write
+# and a dashboard POST cannot interleave a lost update (#147). Windows has no
+# fcntl -> the lock is a no-op there; the dashboard binds loopback only.
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    _fcntl = None
 
 try:
     from zoneinfo import ZoneInfo
@@ -2913,77 +2926,114 @@ def _validate_threshold(key: str, value, cfg: dict) -> str | None:
     return None
 
 
+def _budget_lock_path() -> Path:
+    """Lock file sibling to budget.yaml (``budget.yaml.lock``).
+
+    Mirrors hermes_telemetry.budget._budget_lock_path() but is duplicated here
+    because the dashboard shares zero code with the package (by design — see
+    tests/test_dashboard_plugin_isolation). Both resolve ``budget.yaml`` to the
+    same ``<telemetry_home>`` directory, so the lock file path matches across the
+    CLI writer (``budget.py::_set_budget``) and this dashboard POST handler,
+    serializing them against each other (#147).
+    """
+    return (DB_PATH.parent / "budget.yaml").with_name("budget.yaml.lock")
+
+
+@contextlib.contextmanager
+def _budget_file_lock():
+    """Advisory fcntl.flock around the budget.yaml read-mutate-write.
+
+    Holds the lock for the full critical section so a concurrent writer (CLI
+    ``/budget set`` or another dashboard POST) cannot read between this
+    handler's read and its ``tmp.replace`` and clobber that writer's key
+    (#147). Releases on exit even on exception. No-op on Windows (no fcntl);
+    the dashboard binds loopback only, so single-writer holds there.
+    """
+    lock_path = _budget_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if _fcntl is None:  # pragma: no cover - Windows
+        yield
+        return
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        _fcntl.flock(fd, _fcntl.LOCK_EX)
+        yield
+    finally:
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def api_budget_update(payload, tz_name: str | None = None):
     """Update budget.yaml from POST payload. Returns updated budget status or error."""
     budget_path = DB_PATH.parent / "budget.yaml"
     if not budget_path.exists():
         return {"enabled": False, "error": "budget.yaml not found"}
-
     try:
         import yaml
     except ImportError:
         return {"enabled": False, "error": "PyYAML not installed"}
 
-    try:
-        cfg = yaml.safe_load(budget_path.read_text()) or {}
-    except Exception as e:
-        return {"enabled": False, "error": f"Failed to parse budget.yaml: {e}"}
+    # The entire read-mutate-write is guarded by a single cross-process fcntl.flock
+    # (shared with budget.py::_set_budget via budget.yaml.lock) so two concurrent
+    # writers cannot interleave a read between another writer's read and its
+    # atomic replace and lose an update (#147).
+    with _budget_file_lock():
+        try:
+            cfg = yaml.safe_load(budget_path.read_text()) or {}
+        except Exception as e:
+            return {"enabled": False, "error": f"Failed to parse budget.yaml: {e}"}
 
-    # Expected payload: {"scope": "global", "window": "daily", "limit_usd": 5.0}
-    scope = payload.get("scope", "global")
-    window = payload.get("window", "daily")
-    limit_usd = payload.get("limit_usd")
+        # Expected payload: {"scope": "global", "window": "daily", "limit_usd": 5.0}
+        scope = payload.get("scope", "global")
+        window = payload.get("window", "daily")
+        limit_usd = payload.get("limit_usd")
 
-    # Validate scope/window against allowed sets (prevents YAML key injection)
-    if scope not in ALLOWED_SCOPES:
-        return {"enabled": False, "error": f"invalid scope: {scope!r}"}
-    if window not in ALLOWED_WINDOWS:
-        return {"enabled": False, "error": f"invalid window: {window!r}"}
+        # Validate scope/window against allowed sets (prevents YAML key injection)
+        if scope not in ALLOWED_SCOPES:
+            return {"enabled": False, "error": f"invalid scope: {scope!r}"}
+        if window not in ALLOWED_WINDOWS:
+            return {"enabled": False, "error": f"invalid window: {window!r}"}
 
-    if limit_usd is None:
-        return {"enabled": False, "error": "limit_usd is required"}
+        if limit_usd is None:
+            return {"enabled": False, "error": "limit_usd is required"}
 
-    try:
-        limit_usd = float(limit_usd)
-    except (ValueError, TypeError):
-        return {"enabled": False, "error": "limit_usd must be a number"}
+        try:
+            limit_usd = float(limit_usd)
+        except (ValueError, TypeError):
+            return {"enabled": False, "error": "limit_usd must be a number"}
 
-    if limit_usd < 0:
-        return {"enabled": False, "error": "limit_usd must be >= 0"}
+        if limit_usd < 0:
+            return {"enabled": False, "error": "limit_usd must be >= 0"}
 
-    # Initialize budgets structure if missing
-    if "budgets" not in cfg:
-        cfg["budgets"] = {}
-    if scope not in cfg["budgets"]:
-        cfg["budgets"][scope] = {}
+        # Initialize budgets structure if missing
+        if "budgets" not in cfg:
+            cfg["budgets"] = {}
+        if scope not in cfg["budgets"]:
+            cfg["budgets"][scope] = {}
+        # Update the limit
+        key = f"{window}_usd"
+        cfg["budgets"][scope][key] = limit_usd
+        # Optional: update thresholds (validated, no silent failures)
+        for field, yaml_key in (("soft_pct", "soft_pct"), ("hard_pct", "hard_pct")):
+            if field in payload:
+                err = _validate_threshold(yaml_key, payload[field], cfg)
+                if err:
+                    return {"enabled": False, "error": err}
 
-    # Update the limit
-    key = f"{window}_usd"
-    cfg["budgets"][scope][key] = limit_usd
+        if "on_estimated_mode" in payload:
+            mode = payload["on_estimated_mode"]
+            if mode not in ("warn_only", "enforce"):
+                return {"enabled": False, "error": "on_estimated_mode must be 'warn_only' or 'enforce'"}
+            cfg.setdefault("on_estimated", {})["mode"] = mode
 
-    # Optional: update thresholds (validated, no silent failures)
-    for field, yaml_key in (("soft_pct", "soft_pct"), ("hard_pct", "hard_pct")):
-        if field in payload:
-            err = _validate_threshold(yaml_key, payload[field], cfg)
-            if err:
-                return {"enabled": False, "error": err}
-
-    if "on_estimated_mode" in payload:
-        mode = payload["on_estimated_mode"]
-        if mode not in ("warn_only", "enforce"):
-            return {"enabled": False, "error": "on_estimated_mode must be 'warn_only' or 'enforce'"}
-        cfg.setdefault("on_estimated", {})["mode"] = mode
-
-    # Write back atomically via Path.replace()
-    try:
-        import yaml
-
-        tmp = budget_path.with_suffix(".yaml.tmp")
-        with open(tmp, "w") as f:
-            yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
-        tmp.replace(budget_path)
-    except Exception as e:
-        return {"enabled": False, "error": f"Failed to write budget.yaml: {e}"}
+        # Write back atomically via Path.replace()
+        try:
+            tmp = budget_path.with_suffix(".yaml.tmp")
+            with open(tmp, "w") as f:
+                yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+            tmp.replace(budget_path)
+        except Exception as e:
+            return {"enabled": False, "error": f"Failed to write budget.yaml: {e}"}
 
     # Return updated status by calling api_budget()
     return api_budget(tz_name)

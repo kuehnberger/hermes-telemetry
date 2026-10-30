@@ -589,3 +589,46 @@ def test_budget_forecast_command_accepts_profile_scope(tmp_path):
     out = budget.handle("forecast daily profile my-profile")
     assert "Unknown scope" not in out
     assert "No daily budget" in out  # no per_profile limit configured in this test
+
+
+# ---------------------------------------------------------------------------
+# #147: concurrent writers must not lose updates (fcntl.flock serialization)
+# ---------------------------------------------------------------------------
+def test_set_budget_concurrent_no_lost_updates(tmp_path):
+    """#147 — 20 concurrent _set_budget writers each add a DISTINCT per-profile
+    override. Without cross-process fcntl.flock serialization, a writer that
+    reads the file before a peer's atomic os.replace will clobber that peer's
+    key on its own replace — only a subset survives. With the shared
+    budget.yaml.lock held across the full read-mutate-write, all 20 survive.
+
+    Threads open distinct fds to budget.yaml.lock, so flock(LOCK_EX) blocks
+    across threads on POSIX (per open-file-description), a faithful in-process
+    reproduction of the cross-process race reported in #147.
+    """
+    import threading
+
+    import yaml as _yaml
+
+    n = 20
+    results: dict[int, bool] = {}
+
+    def writer(i: int) -> None:
+        try:
+            msg = budget._set_budget("profile", "daily", float(i), scope_id=f"u{i}")
+            results[i] = "Saved" in msg
+        except Exception:  # noqa: BLE001
+            results[i] = False
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(results.values()), f"writer failures: {results}"
+    budget.reload_config()
+    cfg = _yaml.safe_load(budget._budget_path().read_text())
+    overrides = cfg["budgets"]["per_profile"]["overrides"]
+    assert len(overrides) == n, f"lost updates: only {len(overrides)}/{n} keys survived"
+    for i in range(n):
+        assert overrides[f"u{i}"]["daily_usd"] == float(i)
